@@ -1,0 +1,23 @@
+server {
+    listen       ${PORT};
+    server_name  _;
+    root         /usr/share/nginx/html;
+    index        index.html;
+
+    # Matches the 20 MB cap on Document AI online processing, so an oversized
+    # file is refused here with a clear error rather than deeper in.
+    client_max_body_size 20m;
+
+    location /api/ {
+        proxy_pass              ${BACKEND_URL};
+        proxy_ssl_server_name   on;
+        proxy_set_header        Host $proxy_host;
+        proxy_set_header        X-Forwarded-Proto $scheme;
+        proxy_read_timeout      300s;
+        proxy_send_timeout      300s;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
