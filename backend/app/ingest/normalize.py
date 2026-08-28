@@ -148,16 +148,28 @@ checklist. For every requirement, decide whether the quotation actually states
 it.
 
 Rules:
+- Use only the codes given in the checklist below. Never invent a code, and
+  never merge two requirements into one entry.
+- Return exactly one entry for every requirement in the checklist, in the order
+  they are listed. A checklist of {count} requirements gets {count} entries.
 - Set claimed true only when the document contains text supporting it, and quote
   that sentence verbatim in evidence_text.
 - If a requirement is not mentioned, set claimed false and leave evidence_text
   null. Never treat silence as compliance.
-- Return one entry for every requirement in the checklist.
+- Judge the requirement itself, not the wording around it. A certificate counts
+  when the document says it is provided, whatever phrasing or abbreviation is
+  used, and whatever language the document is written in. Do not require a
+  qualifier the checklist does not ask for.
+- Search the whole document, not only the compliance section. Certificates are
+  often named in a header, a footer, an annex or a line item note.
 
-Checklist:
+Checklist ({count} requirements):
 {checklist}
 
-Document text:
+Compliance section the extractor isolated, if any:
+{block}
+
+Full document text:
 {text}
 """
 
@@ -184,28 +196,72 @@ def normalize_quote(extracted: dict) -> dict:
 
 
 def map_compliance(extracted: dict, requirements: list[dict]) -> dict:
-    """{code: {claimed, evidence_text, evidence_page}} for every requirement."""
+    """{code: {claimed, evidence_text, evidence_page}} for every requirement.
+
+    Two things here exist to stop the same supplier coming back compliant on
+    one run and not the next.
+
+    The document is sent whole. The processor isolates a compliance block, and
+    reading only that block was losing every certificate named in a header, a
+    footer or a line item note - so whether a requirement was found depended on
+    how much of the page the processor happened to capture. The block is still
+    passed separately, because it is the best evidence when it is populated.
+
+    And the model's answer is reconciled against the checklist rather than
+    trusted. A code it invents is dropped, a code it repeats is taken once, and
+    a code it omits stays a gap - silence is never compliance.
+    """
+    codes = [r["code"] for r in requirements]
+    if not codes:
+        return {}
+
     checklist = json.dumps(
         [{"code": r["code"], "label": r["label"], "look_for": r.get("match_hint")}
          for r in requirements], indent=2)
-    # The processor isolates the compliance statements into their own block.
-    # Prefer it over the whole document, and fall back when it is absent.
-    source = _block(extracted, "compliance_text") or (extracted.get("raw_text") or "")
+    block = _block(extracted, "compliance_text")
+    body = extracted.get("raw_text") or ""
+
     prompt = COMPLIANCE_PROMPT.format(
-        checklist=checklist, text=source[:30000])
+        count=len(codes),
+        checklist=checklist,
+        block=block[:8000] or "(the extractor did not isolate one)",
+        text=body[:30000] or "(no document text was extracted)",
+    )
     claims = generate_json(prompt, COMPLIANCE_SCHEMA).get("claims", [])
 
-    mapped = {
-        claim["code"]: {
+    known = set(codes)
+    mapped: dict[str, dict] = {}
+    unknown: list[str] = []
+    for claim in claims:
+        code = (claim or {}).get("code")
+        if not code:
+            continue
+        if code not in known:
+            unknown.append(code)
+            continue
+        if code in mapped:
+            continue
+        mapped[code] = {
             "claimed": bool(claim.get("claimed")),
             "evidence_text": claim.get("evidence_text"),
             "evidence_page": claim.get("evidence_page"),
         }
-        for claim in claims
-    }
-    # Anything the model omitted is a gap, not a pass.
-    for requirement in requirements:
-        mapped.setdefault(
-            requirement["code"],
-            {"claimed": False, "evidence_text": None, "evidence_page": None})
+
+    missing = [code for code in codes if code not in mapped]
+    for code in missing:
+        mapped[code] = {"claimed": False, "evidence_text": None,
+                        "evidence_page": None}
+
+    if unknown:
+        # Not fatal, but it means the checklist and the answer disagree, which
+        # is worth seeing before someone debugs a gate that never fires.
+        log.warning("compliance: ignoring %d code(s) not on the checklist: %s",
+                    len(unknown), ", ".join(sorted(set(unknown))))
+    if missing:
+        log.warning("compliance: model returned no verdict for %d of %d "
+                    "requirements, recorded as gaps: %s",
+                    len(missing), len(codes), ", ".join(missing))
+
+    log.info("compliance: %d of %d requirements claimed",
+             sum(1 for v in mapped.values() if v["claimed"]), len(codes))
     return mapped

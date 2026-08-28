@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 
+from .. import telemetry
 from ..config import settings
 from .tools import ALL_TOOLS
 
@@ -49,43 +50,64 @@ Hard rules:
 Write in plain prose for a buyer. Be concise and specific.
 """
 
-MEMO_INSTRUCTION = """Write an approval package summary for management sign-off,
-using only figures returned by your tools.
+MEMO_INSTRUCTION = """Write the sourcing approval package for management
+sign-off, using only figures returned by your tools.
 
-Structure it as markdown with these sections:
+Output markdown, in exactly this order and with exactly these headings. Do not
+add a section, drop one, or renumber them.
 
-## Recommendation
-One short paragraph: which supplier is recommended as primary, which as
-secondary, and the single most important reason.
+# SOURCING APPROVAL PACKAGE
 
-## Commercial summary
-A markdown table of every supplier: total landed cost, payment terms, lead time,
-award status.
+## <category> — <date of the run>
 
-## How the ranking was reached
-The trail in order: Gate 1, Gate 2, Gate 3, base rank by cost, then the
-promotion rule with each of its four conditions and whether it held.
+Then a two-column table of: Category, Plant, Materials, Prepared by, Date,
+Approver. Leave Prepared by and Approver blank for signature. There is no RFQ
+reference field - the quotations do not carry one, so do not add a row for it.
 
-## Compliance position
-Mandatory requirements per supplier, then advisory gaps. Quote the supporting
-sentence where a tool returned one.
+## 1. Executive Summary
+Three short paragraphs, each starting with its label: "Sourcing event summary:",
+"Sourcing objective:", "Recommendation:".
 
-## Against historical prices
-Each supplier's landed price against the historical average per material, where
-history is available.
+## 2. Supplier Comparison
+A table with the suppliers as columns and these as rows: Total Landed Cost,
+Incoterm, Payment Terms, Lead Time, Quote Valid Until, Items Above Ceiling,
+Compliance Gaps, Award Status.
 
-## Dual sourcing
-What each vendor holds of historical spend today against the proposed share,
-and whether that sits inside the concentration threshold.
+## 3. Commercial Evaluation
+Landed unit price per litre in EUR: one row per material, columns for the
+ceiling price and each supplier. Follow it with one line on discount structures.
 
-## Negotiation priorities
-The line items above the category strategy ceiling, worst impact first.
+## 4. Benchmark Analysis
+A table: Supplier, Total Landed Cost, vs. Historical Average, vs. Category
+Ceiling (basket-equivalent). Mark which supplier is recommended and which is
+cheapest.
 
-## Assumptions and caveats
-Freight adjustments, the FX rate, any data quality flags, and anything the
-engine warned about.
+## 5. Insights & Findings
+Bullets only: the widest price spread, the largest single-item deviation, and
+each concentration or lead-time risk.
 
-Do not add a section that is not listed. Do not invent figures.
+## 6. Category Strategy Alignment
+Bullets only: dual-sourcing policy, ceiling price alignment, supplier
+diversity, compliance checklist.
+
+## 7. Negotiation Opportunities
+A table: Item, Supplier, Gap vs. Ceiling / Benchmark, Opportunity. Worst impact
+first. Follow it with the total potential saving if the recommended supplier's
+flagged items were repriced to ceiling.
+
+## 8. Recommendation
+A table of Rank, Supplier, Decision, then one Rationale paragraph.
+
+## 9. Supporting Documents
+Bullets: the source documents behind this run.
+
+## 10. Approval Information
+A blank two-column table of Approver, Approval Route, Status, Approval
+Comments, where Status lists the three options as empty checkboxes. End with a
+signature and date line.
+
+Currency is EUR throughout and every amount says so. Do not invent a figure, an
+RFQ number or a person's name; leave a field blank rather than filling it.
 """
 
 
@@ -100,25 +122,61 @@ def build_agent(instruction: str = INSTRUCTION):
     )
 
 
-async def _ask(instruction: str, prompt: str) -> str:
+async def _ask(instruction: str, prompt: str, operation: str, run_id: str) -> str:
+    """Run the agent once and collect its text.
+
+    The span opened here is the parent the ADK spans hang off. ADK instruments
+    itself through the global tracer provider, so once telemetry.setup() has
+    registered one, `invocation`, `invoke_agent sourcing_agent`, `call_llm` and
+    `execute_tool <name>` appear underneath this span without ADK being
+    configured for it. Nothing below has to pass a tracer around.
+    """
     from google.adk.runners import InMemoryRunner
     from google.genai import types
 
-    runner = InMemoryRunner(agent=build_agent(instruction), app_name=APP_NAME)
-    session = await runner.session_service.create_session(
-        app_name=APP_NAME, user_id="buyer")
+    with telemetry.tracer().start_as_current_span(f"agent.{operation}") as span:
+        telemetry.set_attributes(
+            span,
+            **{
+                "gen_ai.operation.name": operation,
+                "gen_ai.agent.name": "sourcing_agent",
+                "gen_ai.request.model": settings.vertex_model,
+                "run.id": run_id,
+            },
+        )
 
-    chunks: list[str] = []
-    async for event in runner.run_async(
-        user_id="buyer",
-        session_id=session.id,
-        new_message=types.Content(role="user", parts=[types.Part(text=prompt)]),
-    ):
-        if event.content and event.content.parts:
-            for part in event.content.parts:
-                if getattr(part, "text", None):
-                    chunks.append(part.text)
-    return "".join(chunks).strip()
+        runner = InMemoryRunner(agent=build_agent(instruction), app_name=APP_NAME)
+        session = await runner.session_service.create_session(
+            app_name=APP_NAME, user_id="buyer")
+
+        chunks: list[str] = []
+        async for event in runner.run_async(
+            user_id="buyer",
+            session_id=session.id,
+            new_message=types.Content(role="user", parts=[types.Part(text=prompt)]),
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if getattr(part, "text", None):
+                        chunks.append(part.text)
+
+        answer = "".join(chunks).strip()
+        telemetry.set_attributes(span, **{"gen_ai.response.length": len(answer)})
+        return answer
+
+
+def _agent_failed(operation: str, exc: Exception) -> None:
+    """Record a fallback loudly enough to be findable.
+
+    Falling back is the right behaviour - a buyer still gets an answer from the
+    stored run - but it is also why an agent that never works can look like it
+    is working. The span is marked failed so the trail shows the agent was
+    skipped, and the traceback is logged rather than a one-line message,
+    because "why are there no ADK spans" is otherwise unanswerable from the
+    outside.
+    """
+    telemetry.record_exception(exc)
+    log.exception("agent %s failed, falling back to the stored trail", operation)
 
 
 async def explain(run_id: str, question: str) -> str:
@@ -127,10 +185,15 @@ async def explain(run_id: str, question: str) -> str:
         f"to answer this question from the buyer:\n\n{question}"
     )
     try:
-        return await _ask(INSTRUCTION, prompt)
+        return await _ask(INSTRUCTION, prompt, "explain", run_id)
     except Exception as exc:  # noqa: BLE001 - fall back rather than fail the request
-        log.warning("agent unavailable, using the stored trail instead: %s", exc)
+        _agent_failed("explain", exc)
         return fallback_explanation(run_id)
+    finally:
+        # The agent's spans are the point of this exercise and Cloud Run can
+        # take the CPU away as soon as the response is written, so they go out
+        # now rather than on the batch processor's timer.
+        telemetry.flush()
 
 
 async def draft_memo(run_id: str) -> str:
@@ -139,12 +202,14 @@ async def draft_memo(run_id: str) -> str:
         f"tools and write the approval package summary."
     )
     try:
-        return await _ask(MEMO_INSTRUCTION, prompt)
+        return await _ask(MEMO_INSTRUCTION, prompt, "draft_memo", run_id)
     except Exception as exc:  # noqa: BLE001
-        log.warning("agent unavailable, rendering the memo from the run: %s", exc)
+        _agent_failed("draft_memo", exc)
         from ..render.memo import render_memo
 
         return render_memo(run_id)
+    finally:
+        telemetry.flush()
 
 
 def fallback_explanation(run_id: str) -> str:

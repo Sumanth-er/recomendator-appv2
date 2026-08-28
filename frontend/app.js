@@ -4,7 +4,7 @@
  * already stored on the run, which is why derived figures can be labelled as
  * derived and traced back to the quote they came from.
  */
-
+const HIDDEN_COMPLIANCE = new Set(["TSCA"]);
 const API = "/api";
 const view = document.getElementById("view");
 
@@ -50,6 +50,7 @@ const routes = [
 ];
 
 function route() {
+  clearTimeout(comparison.timer);
   const path = (location.hash || "#/").slice(1);
   for (const [pattern, handler] of routes) {
     const match = path.match(pattern);
@@ -84,15 +85,48 @@ async function home() {
     <div class="card">
       ${comparisons.length === 0
         ? `<p class="muted">Nothing yet. Create a comparison and upload the supplier quotes into it.</p>`
-        : `<table><thead><tr><th>Name</th><th>Created</th><th class="num">Documents</th><th></th></tr></thead>
+        : `<table><thead><tr><th>Name</th><th>Created</th><th class="num">Documents</th><th class="num"></th></tr></thead>
            <tbody>${comparisons.map((c) => `
              <tr>
                <td><a href="#/comparison/${esc(c.comparison_id)}">${esc(c.name)}</a></td>
                <td class="muted small">${esc((c.created_at || "").slice(0, 16).replace("T", " "))}</td>
                <td class="num">${c.document_count}</td>
-               <td class="num"><a href="#/comparison/${esc(c.comparison_id)}">Open</a></td>
+               <td class="num nowrap">
+                 <a href="#/comparison/${esc(c.comparison_id)}">Open</a>
+                 <button class="link-danger" data-delete-comparison="${esc(c.comparison_id)}"
+                   data-name="${esc(c.name)}" data-docs="${c.document_count}">Delete</button>
+               </td>
              </tr>`).join("")}</tbody></table>`}
     </div>`;
+
+  // Deleting takes the quotes and every evaluation run with it, so the count
+  // goes in the prompt - "Delete Wet chemicals basket?" reads much smaller
+  // than what it actually does.
+  view.querySelectorAll("[data-delete-comparison]").forEach((button) => {
+    button.onclick = async () => {
+      const name = button.dataset.name;
+      const docs = Number(button.dataset.docs || 0);
+      const detail = docs
+        ? `\n\nIts ${docs} uploaded document${docs === 1 ? "" : "s"}, the quotes `
+          + `extracted from ${docs === 1 ? "it" : "them"} and every evaluation run `
+          + `will be removed from the database.`
+        : "\n\nIt has no documents yet.";
+      if (!confirm(`Delete the comparison "${name}"?${detail}\n\nThis cannot be undone.`)) {
+        return;
+      }
+      button.disabled = true;
+      try {
+        const result = await api(`/comparisons/${button.dataset.deleteComparison}`,
+                                 { method: "DELETE" });
+        toast(`Deleted "${name}" — ${result.documents} document(s), `
+              + `${result.runs} run(s) removed`);
+        route();
+      } catch (err) {
+        button.disabled = false;
+        toast(err.message);
+      }
+    };
+  });
 
   document.getElementById("new-btn").onclick = async () => {
     const name = document.getElementById("new-name").value.trim() || "New comparison";
@@ -250,6 +284,8 @@ async function showExtracted(quoteId) {
     <div class="card">
       <div class="row small">
         <span><strong>Quote</strong> ${esc(quote.quote_no || "-")}</span>
+        <span><strong>Quote date</strong> ${esc(quote.quote_date || "-")}</span>
+        <span><strong>Valid until</strong> ${esc(quote.valid_until || "-")}${expiryPill(quote.valid_until)}</span>
         <span><strong>Currency</strong> ${esc(quote.currency || "-")}</span>
         <span><strong>Incoterm</strong> ${esc(quote.incoterm || "-")} ${esc(quote.incoterm_location || "")}</span>
         <span><strong>Payment</strong> ${quote.payment_terms_net_days ? "Net " + quote.payment_terms_net_days : "-"}</span>
@@ -259,11 +295,18 @@ async function showExtracted(quoteId) {
     </div>
     <div class="card scroll">
       <table><thead><tr>
-        <th>#</th><th>CAS</th><th>Description</th><th class="num">Qty</th><th>UoM</th>
-        <th class="num">Unit price</th><th class="num">Line total</th><th>MOQ</th><th>Checks</th>
+        <th>#</th><th>Material</th><th>Supplier's description</th>
+        <th class="num">Qty</th><th>UoM</th>
+        <th class="num">Unit price<div class="unit">quote currency</div></th>
+        <th class="num">Line total<div class="unit">quote currency</div></th><th>MOQ</th><th>Checks</th>
       </tr></thead><tbody>
       ${quote.lines.map((l) => `<tr>
-        <td>${l.line_no}</td><td>${esc(l.cas_no || "-")}</td>
+        <td>${l.line_no}</td>
+        <td>${l.material_name
+              ? `${esc(l.material_name)}<div class="derived">CAS ${esc(l.cas_no)}</div>`
+              : l.cas_no
+                ? `<span class="muted">CAS ${esc(l.cas_no)}</span><div class="derived">not in the demand basket</div>`
+                : `<span class="muted">no CAS resolved</span>`}</td>
         <td class="small">${esc(l.supplier_description || "-")}</td>
         <td class="num">${num(l.quantity, 0)}</td><td>${esc(l.uom || "-")}</td>
         <td class="num">${num(l.unit_price, 4)}</td>
@@ -275,7 +318,7 @@ async function showExtracted(quoteId) {
     </div>
     <div class="card">
       <h3>Compliance statements found</h3>
-      ${Object.entries(quote.compliance || {}).map(([code, c]) => `
+      ${Object.entries(quote.compliance || {}).filter(([code]) => !HIDDEN_COMPLIANCE.has(code)).map(([code, c]) => `
         <div class="small" style="margin-bottom:6px">
           <span class="pill ${c.claimed ? "ok" : "warn"}">${c.claimed ? "stated" : "gap"}</span>
           <strong>${esc(code)}</strong>
@@ -311,33 +354,35 @@ async function run(runId) {
       ${r.warnings.map(esc).join("<br>")}</div>` : ""}
 
     <div class="kpis">
-      <div class="kpi"><div class="label">Recommended</div>
+      <div class="kpi"><div class="label">Recommended supplier</div>
         <div class="value">${esc(k.recommended_supplier || "none")}</div>
-        <div class="note">EUR ${eur(k.recommended_total_eur)} landed</div></div>
+        <div class="note"><span class="unit">EUR</span> ${eur(k.recommended_total_eur)} total landed</div></div>
       <div class="kpi"><div class="label">Spread across suppliers</div>
-        <div class="value">${eur(k.spread_eur)}</div>
-        <div class="note">${esc(k.spread_pct)}% of basket value</div></div>
+        <div class="value"><span class="unit">EUR</span> ${eur(k.spread_eur)}</div>
+        <div class="note">${esc(k.spread_pct)}% of total basket value</div></div>
       <div class="kpi"><div class="label">Ceiling-equivalent basket</div>
-        <div class="value">${eur(k.ceiling_equivalent_total_eur)}</div>
+        <div class="value"><span class="unit">EUR</span> ${eur(k.ceiling_equivalent_total_eur)}</div>
         <div class="note">every item at its ceiling price</div></div>
-      <div class="kpi"><div class="label">Renegotiation candidates</div>
-        <div class="value">${k.renegotiation_count}</div>
-        <div class="note">line items above ceiling</div></div>
+      <div class="kpi"><div class="label">Negotiation opportunities</div>
+        <div class="value">${k.renegotiation_count} <span class="unit">${k.renegotiation_count === 1 ? "line" : "lines"}</span></div>
+        <div class="note">priced above the category ceiling</div></div>
       <div class="kpi"><div class="label">Data quality flags</div>
-        <div class="value">${k.data_quality_issues}</div>
+        <div class="value">${k.data_quality_issues} <span class="unit">${k.data_quality_issues === 1 ? "flag" : "flags"}</span></div>
         <div class="note">flagged, not corrected</div></div>
     </div>
 
     <h2>Supplier summary</h2>
-    <div class="card scroll">
+    <div class="card">
+      <div class="scroll">
       <table><thead><tr>
-        <th>Rank</th><th>Supplier</th><th class="num">Goods</th><th class="num">Freight</th>
-        <th class="num">Discount</th><th class="num">Total landed</th>
-        <th>Incoterm</th><th>Payment</th><th>Lead time</th><th>Status</th>
+        <th>Rank</th><th>Supplier</th><th class="num">Goods (EUR)</th>
+        <th class="num">Freight (EUR)</th>
+        <th class="num">Discount (EUR)</th><th class="num">Total landed (EUR)</th>
+        <th>Incoterm</th><th>Payment</th><th>Lead time</th>
+        <th>Quote date</th><th>Valid until</th><th>Status</th>
       </tr></thead><tbody>
       ${r.suppliers.map((s) => `<tr>
-        <td>${s.final_rank ?? "-"}${s.base_rank && s.base_rank !== s.final_rank
-          ? `<span class="derived" title="base rank by cost"> (was ${s.base_rank})</span>` : ""}</td>
+        <td>${s.final_rank ?? "-"}</td>
         <td><strong>${esc(s.supplier_name)}</strong></td>
         <td class="num">${eur(s.goods_subtotal_eur)}</td>
         <td class="num">${eur(s.freight_amount_eur)}<div class="derived ${s.freight_policy_matched === false ? "above" : ""}"
@@ -350,13 +395,17 @@ async function run(runId) {
         <td>${esc(s.incoterm || "-")}</td>
         <td>${s.payment_terms_net_days ? "Net " + s.payment_terms_net_days : "-"}</td>
         <td>${s.lead_time_min_weeks ?? "-"}-${s.lead_time_max_weeks ?? "-"} wks</td>
+        <td>${esc(s.quote_date || "-")}</td>
+        <td>${esc(s.valid_until || "-")}${validityNote(s)}</td>
         <td><span class="pill ${s.award_status === "PRIMARY" ? "ok"
           : s.award_status === "SECONDARY" ? "info" : "warn"}">${esc((s.award_status || "").toLowerCase().replace("_", " "))}</span></td>
       </tr>`).join("")}
       </tbody></table>
-      <p class="small muted" style="margin-top:10px">Freight is a fixed adjustment selected by Incoterm, not a quoted figure.
+      </div>
+      ${primaryRationale(r)}
+      <p class="small muted" style="margin-top:10px">All amounts in EUR. Freight is a fixed adjustment selected by Incoterm, not a quoted figure.
       Totals are extended from landed prices using required volumes.</p>
-    </div>
+      </div>
 
     ${lineMatrix(r)}
     ${commercialTermsPanel(r)}
@@ -384,6 +433,57 @@ async function run(runId) {
   };
 }
 
+/* Validity on the extraction screen, where there is no run yet to measure
+ * against. This one is against today on purpose: nothing has been evaluated,
+ * so the only useful question is whether the quote is still good now. */
+function expiryPill(validUntil) {
+  if (!validUntil) return "";
+  const days = Math.ceil(
+    (new Date(validUntil + "T00:00:00Z") - new Date()) / 86400000);
+  if (days < 0) return ` <span class="pill bad">expired</span>`;
+  if (days <= 14) return ` <span class="pill warn">${days} days left</span>`;
+  return "";
+}
+
+/* Quote validity. The engine measured this against the run's own date, not
+ * against today, so an old run keeps reading the way it did when it was
+ * evaluated rather than turning red as the page ages. */
+function validityNote(s) {
+  if (s.is_expired) {
+    return `<div class="derived above" title="already expired when this run was evaluated">expired</div>`;
+  }
+  if (s.days_to_expiry != null && s.days_to_expiry <= 14) {
+    return `<div class="derived">${s.days_to_expiry} days left</div>`;
+  }
+  return "";
+}
+
+/* Why rank 1 won, shown under the table it refers to rather than in a card of
+ * its own. Every value here was stored by the engine: the promotion rule fired
+ * if and only if the base rank by cost was not already 1. */
+function primaryRationale(r) {
+  const top = r.suppliers.find((s) => s.final_rank === 1);
+  if (!top) return "";
+  const promoted = top.base_rank && top.base_rank !== top.final_rank;
+  const beaten = promoted
+    ? r.suppliers.find((s) => s.supplier_id === top.promoted_over)
+    : null;
+
+  return `
+    <div class="rationale">
+      <h3>Why ${esc(top.supplier_name)} is ranked 1</h3>
+      <p>${esc(top.primary_reason || "")}</p>
+      <p class="small muted">${promoted
+        ? `Base rank by cost was ${top.base_rank}. The promotion rule moved it above
+           ${esc(beaten ? beaten.supplier_name : (top.promoted_over || "the cheaper supplier"))},
+           which needs all four of its conditions to hold independently — each one is
+           shown in the promotion rule panel below.`
+        : `Lowest total landed cost at EUR ${eur(top.total_landed_cost_eur)},
+           after passing all three gates.`}
+      </p>
+    </div>`;
+}
+
 function lineMatrix(r) {
   const suppliers = r.suppliers.map((s) => s.supplier_id);
   const names = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s.supplier_name]));
@@ -409,9 +509,10 @@ function lineMatrix(r) {
     <h2>Landed price per litre, by material</h2>
     <div class="card scroll">
       <table><thead><tr>
-        <th>Material</th><th class="num">Required (L)</th><th class="num">Ceiling</th>
-        ${hasHistorical ? `<th class="num">Historical avg</th>` : ""}
-        ${suppliers.map((s) => `<th class="num">${esc(names[s])}</th>`).join("")}
+        <th>Material</th><th class="num">Required (L)</th>
+        <th class="num">Ceiling (EUR/L)</th>
+        ${hasHistorical ? `<th class="num">Historical avg (EUR/L)</th>` : ""}
+        ${suppliers.map((s) => `<th class="num">${esc(names[s])}<div class="unit">EUR/L landed</div></th>`).join("")}
       </tr></thead><tbody>
       ${materials.map((m) => `<tr>
         <td>${esc(m.material_name)}<div class="derived">CAS ${esc(m.cas_no)}</div></td>
@@ -491,11 +592,11 @@ function promotionPanel(r) {
 function renegotiationPanel(r) {
   if (!(r.renegotiation || []).length) return "";
   return `
-    <h2>Renegotiation candidates</h2>
+    <h2>Negotiation Opportunities</h2>
     <div class="card scroll">
       <table><thead><tr><th>Supplier</th><th>Material</th>
-        <th class="num">Landed EUR/L</th><th class="num">Ceiling</th>
-        <th class="num">Gap</th><th class="num">Annual impact (EUR)</th></tr></thead><tbody>
+        <th class="num">Landed (EUR/L)</th><th class="num">Ceiling (EUR/L)</th>
+        <th class="num">Gap (%)</th><th class="num">Annual impact (EUR)</th></tr></thead><tbody>
       ${r.renegotiation.map((c) => `<tr>
         <td>${esc(c.supplier_name)}</td><td>${esc(c.material_name)}</td>
         <td class="num above">${num(c.landed_price_eur_l, 2)}</td>
@@ -510,15 +611,37 @@ function renegotiationPanel(r) {
 function concentrationPanel(r) {
   const hc = r.historical_context || {};
   const vendors = hc.incumbent_vendors || [];
-  const allocation = r.allocation || [];
-  if (!allocation.length && !vendors.length) return "";
+  const byId = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s]));
   const names = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s.supplier_name]));
+
+  // The primary award is not a dual-sourcing question - this panel exists to
+  // show the second source that policy requires, so the primary is stated in
+  // the footnote rather than given a row of its own.
+  const primary = (r.allocation || []).find(
+    (a) => (byId[a.supplier_id] || {}).final_rank === 1);
+  const allocation = (r.allocation || []).filter(
+    (a) => (byId[a.supplier_id] || {}).final_rank !== 1);
+
+  if (!allocation.length && !vendors.length) return "";
+
+  if (!allocation.length) {
+    return `
+      <h2>Dual sourcing and concentration</h2>
+      <div class="card">
+        <p class="muted">No second source qualified. Every other supplier was
+        excluded at a gate, so the whole basket would sit with
+        ${esc(primary ? names[primary.supplier_id] || primary.supplier_id : "one supplier")}
+        — above the ${esc(hc.concentration_threshold_pct || "60")}% concentration
+        threshold the category strategy sets.</p>
+      </div>`;
+  }
 
   return `
     <h2>Dual sourcing and concentration</h2>
-    <div class="card scroll">
-      <table><thead><tr><th>Supplier</th><th class="num">Share today</th>
-        <th class="num">Proposed share</th><th class="num">Proposed spend</th>
+    <div class="card">
+      <div class="scroll">
+      <table><thead><tr><th>Second source</th><th class="num">Share today</th>
+        <th class="num">Proposed share</th><th class="num">Proposed spend (EUR)</th>
         <th>Against the ${esc(hc.concentration_threshold_pct || "60")}% threshold</th></tr></thead>
       <tbody>${allocation.map((a) => {
         const today = vendors.find((v) => v.supplier_id === a.supplier_id);
@@ -537,6 +660,11 @@ function concentrationPanel(r) {
               : `<span class="pill ok">within policy</span>`}</td>
         </tr>`;
       }).join("")}</tbody></table>
+      </div>
+      ${primary ? `<p class="small muted" style="margin-top:10px">
+        The remaining ${esc(primary.allocation_pct)}% (EUR ${eur(primary.allocated_spend_eur)})
+        goes to the primary award, ${esc(names[primary.supplier_id] || primary.supplier_id)},
+        shown in the supplier summary above.</p>` : ""}
       ${vendors.filter((v) => !v.is_quoting).length ? `<p class="small muted" style="margin-top:10px">
         Incumbent vendors not quoting:
         ${vendors.filter((v) => !v.is_quoting).map((v) =>
@@ -564,6 +692,8 @@ function commercialTermsPanel(r) {
       <td>${s.payment_terms_net_days ? "Net " + s.payment_terms_net_days : "-"}</td>
       <td>${s.lead_time_min_weeks ?? "-"}-${s.lead_time_max_weeks ?? "-"} wks
         <div class="derived">midpoint ${esc(s.lead_time_midpoint_weeks ?? "-")}</div></td>
+      <td>${esc(s.quote_date || "-")}</td>
+      <td>${esc(s.valid_until || "-")}${validityNote(s)}</td>
       <td class="small">${unique.length ? unique.join("<br>") : "<span class='muted'>not stated</span>"}</td>
       <td class="small">${discounts}</td>
     </tr>`;
@@ -573,7 +703,8 @@ function commercialTermsPanel(r) {
     <h2>Commercial terms</h2>
     <div class="card scroll">
       <table><thead><tr><th>Supplier</th><th>Incoterm</th><th>Payment terms</th>
-        <th>Lead time</th><th>MOQ terms</th><th>Discount structure</th></tr></thead>
+        <th>Lead time</th><th>Quote date</th><th>Valid until</th>
+        <th>MOQ terms</th><th>Discount structure</th></tr></thead>
       <tbody>${rows}</tbody></table>
       <p class="small muted" style="margin-top:10px">Payment terms and lead time also feed
       the promotion rule. MOQ terms feed Gate 2.</p>
@@ -581,7 +712,7 @@ function commercialTermsPanel(r) {
 }
 
 function compliancePanel(r) {
-  const matrix = r.compliance_matrix || [];
+  const matrix = (r.compliance_matrix || []).filter((row) => !HIDDEN_COMPLIANCE.has(row.code));
   if (!matrix.length) return "";
   const suppliers = r.suppliers.map((s) => s.supplier_id);
   const names = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s.supplier_name]));
@@ -613,7 +744,7 @@ function dataQualityPanel(r) {
     <h2>Data quality</h2>
     <div class="card scroll">
       <table><thead><tr><th>Supplier</th><th>Material</th><th>Issue</th>
-        <th class="num">Stated</th><th class="num">Recomputed</th><th class="num">Difference</th></tr></thead>
+        <th class="num">Stated (EUR)</th><th class="num">Recomputed (EUR)</th><th class="num">Difference (EUR)</th></tr></thead>
       <tbody>${issues.map((d) => `<tr>
         <td>${esc(d.supplier_name)}</td><td>${esc(d.material_name)}</td>
         <td><span class="pill warn">${esc((d.flag || "").toLowerCase().replace(/_/g, " "))}</span>
@@ -643,28 +774,31 @@ function wireAgent(runId, r) {
   document.getElementById("suggested").innerHTML =
     suggestions.map((q) => `<button class="link" data-q="${esc(q)}">${esc(q)}</button>`).join("");
 
-  const askBox = document.getElementById("question");
-  const answerBox = document.getElementById("answer");
+  const $ = (id) => document.getElementById(id);
 
   async function ask(question) {
     if (!question.trim()) return;
-    answerBox.innerHTML = `<p class="muted small">Thinking…</p>`;
+    if ($("answer")) $("answer").innerHTML = `<p class="muted small">Thinking…</p>`;
     try {
       const response = await api(`/runs/${runId}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question }),
       });
-      answerBox.innerHTML = `<div class="answer">${markdown(response.answer)}</div>`;
+      if ($("answer")) {
+        $("answer").innerHTML = `<div class="answer">${markdown(response.answer)}</div>`;
+      }
     } catch (err) {
-      answerBox.innerHTML = `<div class="banner bad">${esc(err.message)}</div>`;
+      if ($("answer")) {
+        $("answer").innerHTML = `<div class="banner bad">${esc(err.message)}</div>`;
+      }
     }
   }
 
-  document.getElementById("ask-btn").onclick = () => ask(askBox.value);
-  askBox.onkeydown = (e) => { if (e.key === "Enter") ask(askBox.value); };
+  $("ask-btn").onclick = () => ask($("question").value);
+  $("question").onkeydown = (e) => { if (e.key === "Enter") ask(e.target.value); };
   document.querySelectorAll("[data-q]").forEach((b) => {
-    b.onclick = () => { askBox.value = b.dataset.q; ask(b.dataset.q); };
+    b.onclick = () => { $("question").value = b.dataset.q; ask(b.dataset.q); };
   });
 }
 
@@ -672,22 +806,47 @@ function wireAgent(runId, r) {
 
 async function packageView(runId) {
   view.innerHTML = `<h1>Approval package</h1><p class="muted">Drafting from the stored run…</p>`;
-  let summary;
-  try {
-    summary = (await api(`/runs/${runId}/package`)).summary_md;
-  } catch {
-    summary = (await api(`/runs/${runId}/package`, { method: "POST" })).summary_md;
+
+  // A package is stored once drafted, so the first visit creates it and later
+  // visits show what was drafted then. Regenerate replaces it from the run.
+  async function load(regenerate) {
+    if (!regenerate) {
+      try {
+        return (await api(`/runs/${runId}/package`)).summary_md;
+      } catch { /* nothing drafted yet - fall through and draft it */ }
+    }
+    return (await api(`/runs/${runId}/package`, { method: "POST" })).summary_md;
   }
-  view.innerHTML = `
-    <div class="spread">
-      <h1>Approval package</h1>
-      <div class="row">
-        <a href="#/run/${esc(runId)}" class="muted small">Back to dashboard</a>
-        <button id="print">Print or save as PDF</button>
+
+  function render(summary) {
+    view.innerHTML = `
+      <div class="spread no-print">
+        <h1>Approval package</h1>
+        <div class="row">
+          <a href="#/run/${esc(runId)}" class="muted small">Back to dashboard</a>
+          <button id="regen">Regenerate</button>
+          <button class="primary" id="print">Print or save as PDF</button>
+        </div>
       </div>
-    </div>
-    <div class="memo" id="memo">${markdown(summary)}</div>`;
-  document.getElementById("print").onclick = () => window.print();
+      <div class="memo" id="memo">${markdown(summary)}</div>`;
+
+    document.getElementById("print").onclick = () => window.print();
+    document.getElementById("regen").onclick = async () => {
+      const button = document.getElementById("regen");
+      button.disabled = true;
+      button.textContent = "Regenerating…";
+      try {
+        render(await load(true));
+        toast("Approval package redrafted from the stored run");
+      } catch (err) {
+        button.disabled = false;
+        button.textContent = "Regenerate";
+        toast(err.message);
+      }
+    };
+  }
+
+  render(await load(false));
 }
 
 /* ------------------------------------------------------------- reference */
@@ -787,7 +946,7 @@ async function reference() {
     </div>
 
     <h2>Freight adjustment by Incoterm</h2>
-    <div class="card scroll"><table><thead><tr><th>Incoterm</th><th class="num">Uplift</th><th>Basis</th><th>Type</th></tr></thead><tbody>
+    <div class="card scroll"><table><thead><tr><th>Incoterm</th><th class="num">Uplift (%)</th><th>Basis</th><th>Type</th></tr></thead><tbody>
       ${data.freight_policy.map((f) => `<tr><td>${esc(f.incoterm)}</td>
         <td class="num">${f.freight_adj_pct}%</td><td class="small">${esc(f.basis_note)}</td>
         <td><span class="pill ${f.is_estimate ? "warn" : "ok"}">${f.is_estimate ? "estimate" : "quoted"}</span></td></tr>`).join("")}
@@ -805,8 +964,9 @@ async function reference() {
       </div>
       <div id="hist-result"></div>
       ${data.historical.length ? `<div class="scroll" style="margin-top:14px">
-        <table><thead><tr><th>CAS</th><th>Material no.</th><th class="num">Avg</th>
-          <th class="num">Min</th><th class="num">Max</th><th class="num">Last invoiced</th>
+        <table><thead><tr><th>CAS</th><th>Material no.</th><th class="num">Avg (EUR/L)</th>
+          <th class="num">Min (EUR/L)</th><th class="num">Max (EUR/L)</th>
+          <th class="num">Last invoiced (EUR/L)</th>
           <th class="num">PO lines</th><th>Period</th></tr></thead><tbody>
         ${data.historical.map((h) => `<tr><td>${esc(h.cas_no)}</td>
           <td class="small">${esc(h.material_number || "-")}</td>
@@ -820,7 +980,7 @@ async function reference() {
         </tbody></table>
         ${data.vendor_spend.length ? `<h3>Spend by vendor</h3>
           <table><thead><tr><th>Vendor</th><th class="num">Spend EUR</th>
-            <th class="num">Share</th></tr></thead><tbody>
+            <th class="num">Share (%)</th></tr></thead><tbody>
           ${data.vendor_spend.map((v) => `<tr><td>${esc(v.vendor_name)}</td>
             <td class="num">${eur(v.spend_eur)}</td>
             <td class="num">${esc(v.share_pct || "-")}%</td></tr>`).join("")}
@@ -833,7 +993,7 @@ async function reference() {
 
     <h2>Compliance checklist</h2>
     <div class="card"><table><thead><tr><th>Code</th><th>Requirement</th><th>Tier</th></tr></thead><tbody>
-      ${data.compliance_requirements.map((c) => `<tr><td><code>${esc(c.code)}</code></td>
+            ${data.compliance_requirements.filter((c) => !HIDDEN_COMPLIANCE.has(c.code)).map((c) => `<tr><td><code>${esc(c.code)}</code></td>
         <td>${esc(c.label)}</td>
         <td><span class="pill ${c.tier === "MANDATORY" ? "bad" : "info"}">${esc(c.tier.toLowerCase())}</span></td></tr>`).join("")}
     </tbody></table>

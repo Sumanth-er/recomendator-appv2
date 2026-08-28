@@ -23,6 +23,8 @@ from .models import (
     FreightPolicy, HistoricalPrice, Material, PolicyConfig, Quote, Supplier,
 )
 
+from . import telemetry
+
 
 def _d(value) -> Decimal | None:
     if value is None:
@@ -139,6 +141,8 @@ def to_quote_input(
         supplier_name=supplier.short_name if supplier else quote.supplier_id,
         currency=quote.currency or "EUR",
         incoterm=quote.incoterm,
+        quote_date=quote.quote_date,
+        valid_until=quote.valid_until,
         payment_terms_net_days=quote.payment_terms_net_days,
         lead_time_min_weeks=_d(quote.lead_time_min_weeks),
         lead_time_max_weeks=_d(quote.lead_time_max_weeks),
@@ -185,16 +189,20 @@ def run_evaluation(session: Session, comparison_id: str) -> EvaluationRun:
         supplier = session.get(Supplier, quote.supplier_id)
         quote_inputs.append(to_quote_input(quote, supplier, approved))
 
-    result = evaluate(
-        quotes=quote_inputs,
-        materials=materials,
-        demand=demand,
-        benchmarks=benchmarks,
-        policy=policy,
-        historical=historical,
-        incumbent_spend=incumbent,
-        engine_version=settings.engine_version,
-    )
+    with telemetry.tracer().start_as_current_span("engine.evaluate") as span:
+        span.set_attribute("comparison.id", comparison_id)
+        span.set_attribute("quote.count", len(quotes))
+        span.set_attribute("engine.version", settings.engine_version)
+        result = evaluate(
+            quotes=quote_inputs,
+            materials=materials,
+            demand=demand,
+            benchmarks=benchmarks,
+            policy=policy,
+            historical=historical,
+            incumbent_spend=incumbent,
+            engine_version=settings.engine_version,
+        )
 
     run = EvaluationRun(
         comparison_id=comparison_id,

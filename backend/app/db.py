@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
+from . import telemetry
 from .config import settings
 from .models import Base
 
@@ -20,6 +21,10 @@ engine = create_engine(
     pool_recycle=1800,
     connect_args={"check_same_thread": False} if is_sqlite else {},
 )
+# Emits a span per statement, parented to whatever span is current - the HTTP
+# request, an ingest stage, or an agent tool call. Optional: a missing
+# instrumentation package costs the query spans, not the database.
+telemetry.instrument_sqlalchemy(engine)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 

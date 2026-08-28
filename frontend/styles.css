@@ -34,7 +34,6 @@ body {
 }
 .topbar .wrap { display: flex; align-items: center; gap: 14px; height: 60px; }
 .brand { font-weight: 600; color: var(--text); text-decoration: none; font-size: 16px; }
-.brand-sub { color: var(--muted); font-size: 13px; }
 .topbar nav { margin-left: auto; display: flex; gap: 18px; }
 .topbar nav a { color: var(--muted); text-decoration: none; font-size: 14px; }
 .topbar nav a:hover { color: var(--accent); }
@@ -71,6 +70,11 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.primary:hover:not(:disabled) { background: #12508d; color: #fff; }
 button.link { border: none; background: none; color: var(--accent); padding: 2px 4px; }
+button.link-danger {
+  border: none; background: none; color: var(--bad);
+  padding: 2px 4px; margin-left: 10px; font-size: 14px;
+}
+button.link-danger:hover:not(:disabled) { color: var(--bad); text-decoration: underline; }
 
 input[type=text] {
   font: inherit; padding: 9px 12px; border: 1px solid var(--line-strong);
@@ -86,9 +90,30 @@ tbody tr:last-child td { border-bottom: none; }
 
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 8px; }
 .kpi { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
-.kpi .label { font-size: 12.5px; color: var(--muted); margin-bottom: 4px; }
-.kpi .value { font-size: 21px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.kpi .note { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.kpi .label { font-size: 11.5px; color: var(--muted); margin-bottom: 3px; }
+/* Sized to fit a supplier name and a six-figure amount on one line without
+   wrapping, which 21px did not. */
+.kpi .value { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums;
+  line-height: 1.35; overflow-wrap: anywhere; }
+.kpi .note { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+
+/* The unit a figure is in - EUR, lines, flags. Muted and a size down, so the
+   number stays the thing you read first but never sits there unlabelled. */
+.unit { font-size: .78em; font-weight: 500; color: var(--muted);
+  letter-spacing: .02em; }
+
+.nowrap { white-space: nowrap; }
+
+/* Why rank 1 won, inside the supplier summary card and directly under the
+   table it explains. */
+.rationale {
+  margin-top: 12px; padding: 12px 14px;
+  background: var(--accent-soft); border-radius: var(--radius);
+  border: 1px solid #cfe2f5;
+}
+.rationale h3 { margin: 0 0 6px; font-size: 14.5px; }
+.rationale p { margin: 0 0 6px; }
+.rationale p:last-child { margin-bottom: 0; }
 
 .pill {
   display: inline-block; padding: 2px 9px; border-radius: 999px;
@@ -122,6 +147,24 @@ tbody tr:last-child td { border-bottom: none; }
 .memo { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px 26px; }
 .memo h1 { font-size: 20px; } .memo h2 { font-size: 16px; margin-top: 24px; }
 .memo table { margin: 8px 0 14px; }
+/* The package is ten numbered sections of mostly tables. Give them room to
+   breathe and let a wide one scroll rather than squeezing the columns. */
+.memo h2 { border-bottom: 1px solid var(--line); padding-bottom: 5px;
+  color: var(--accent); }
+.memo h2:first-of-type { border-bottom: none; color: var(--text); }
+.memo table { display: block; overflow-x: auto; max-width: 100%; }
+.memo td, .memo th { vertical-align: top; }
+.memo em { color: var(--muted); font-size: 13px; }
+
+/* Print the document, not the chrome around it. */
+@media print {
+  .topbar, .no-print, .toast { display: none !important; }
+  .memo { border: none; padding: 0; }
+  .wrap { max-width: none; padding: 0; }
+  body { background: #fff; }
+  .memo h2 { page-break-after: avoid; }
+  .memo table { page-break-inside: avoid; }
+}
 
 .toast {
   position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);

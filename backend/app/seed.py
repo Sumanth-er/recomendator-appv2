@@ -6,17 +6,21 @@ rule thresholds. They are configuration the engine cannot run without, not
 sample transactions. Suppliers and quotes are never seeded; those come only
 from uploaded documents.
 
-Seeding is idempotent: existing rows are left untouched.
+Seeding is idempotent. Existing rows are left untouched, with one deliberate
+exception: the compliance checklist is reconciled against this file on every
+start-up, because its wording is what the extraction prompt shows the model.
+See seed_reference_data for what that does and does not overwrite.
 """
 from __future__ import annotations
 
 import logging
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .models import (
-    Benchmark, ComplianceRequirement, Demand, FreightPolicy, Material,
-    PolicyConfig,
+    Benchmark, CategoryStrategy, ComplianceRequirement, Demand, FreightPolicy,
+    Material, PolicyConfig,
 )
 
 log = logging.getLogger(__name__)
@@ -56,12 +60,12 @@ FREIGHT = [
 COMPLIANCE = [
     ("SEMI_C_CERT", "SEMI-C grade certification", "MANDATORY",
      "SEMI C1, SEMI-C, SEMI grade certification"),
-    ("BATCH_COA", "Batch-level certificate of analysis", "MANDATORY",
-     "certificate of analysis, CoA per batch, batch CoA"),
-    ("SDS_LANGUAGE", "Safety data sheet in required language", "ADVISORY",
-     "SDS, safety data sheet, German language, EU language"),
-    ("ISO_9001", "ISO 9001 quality management", "ADVISORY", "ISO 9001"),
-    ("ISO_14001", "ISO 14001 environmental management", "ADVISORY", "ISO 14001"),
+    ("BATCH_COA", "certificate of analysis", "MANDATORY",
+     "certificate of analysis, CoA per batch, Certificate of Analysis (CoA), batch CoA"),
+    ("SDS_LANGUAGE", "Safety data sheet", "ADVISORY",
+     "SDS, safety data sheet, Safety Data Sheet (SDS)"),
+    ("ISO_9001", "ISO 9001", "ADVISORY", "ISO 9001"),
+    ("ISO_14001", "ISO 14001", "ADVISORY", "ISO 14001"),
     ("REACH", "REACH registration", "ADVISORY", "REACH, EC 1907/2006"),
     ("TSCA", "TSCA compliance", "ADVISORY", "TSCA, Toxic Substances Control Act"),
 ]
@@ -96,6 +100,7 @@ POLICY = [
 
 def seed_reference_data(session: Session) -> None:
     added = 0
+    updated = 0
 
     for cas, name, grade, density in MATERIALS:
         if not session.get(Material, cas):
@@ -120,11 +125,38 @@ def seed_reference_data(session: Session) -> None:
                                       basis_note=note, is_estimate=est))
             added += 1
 
+    # The compliance checklist is the one block of reference data that is
+    # reconciled rather than only inserted. Its label and match_hint are what
+    # the extraction prompt shows the model, so editing them in this file has
+    # to reach a database that was seeded months ago - otherwise the wording
+    # driving extraction is whatever shipped first, and changing it here looks
+    # like it does nothing.
+    strategy_owns_checklist = session.scalar(
+        select(CategoryStrategy).where(CategoryStrategy.is_active.is_(True))
+    ) is not None
+
     for code, label, tier, hint in COMPLIANCE:
-        if not session.get(ComplianceRequirement, code):
+        row = session.get(ComplianceRequirement, code)
+        if not row:
             session.add(ComplianceRequirement(code=code, label=label, tier=tier,
                                               match_hint=hint))
             added += 1
+            continue
+
+        # A strategy upload can set label and tier; it never sets match_hint.
+        # So the hint is always ours to correct, and the other two only while
+        # no strategy is in force - re-uploading the strategy is what changes
+        # them after that.
+        if row.match_hint != hint:
+            row.match_hint = hint
+            updated += 1
+        if not strategy_owns_checklist:
+            if row.label != label:
+                row.label = label
+                updated += 1
+            if row.tier != tier:
+                row.tier = tier
+                updated += 1
 
     for key, value, unit, desc, ref in POLICY:
         if not session.get(PolicyConfig, key):
@@ -132,6 +164,6 @@ def seed_reference_data(session: Session) -> None:
                                      description=desc, section_ref=ref))
             added += 1
 
-    if added:
+    if added or updated:
         session.commit()
-        log.info("seeded %d reference rows", added)
+        log.info("reference data: %d rows seeded, %d reconciled", added, updated)

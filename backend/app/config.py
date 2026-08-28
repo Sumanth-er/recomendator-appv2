@@ -52,3 +52,29 @@ class Settings:
 
 
 settings = Settings()
+
+
+def configure_agent_env() -> None:
+    """Point ADK's own google-genai client at Vertex.
+
+    ADK does not take our settings. It constructs its own ``google.genai``
+    client and reads these three environment names, and with none of them set
+    that client defaults to the Gemini Developer API and raises "No API key was
+    provided" before a single request goes out.
+
+    That failure is invisible from the outside: the agent's caller falls back to
+    the deterministic memo, so a buyer still gets an answer, and the only trace
+    of it is that no ADK span ever appears. Deriving the values here is what the
+    README and .env.example have always said happens at start-up.
+
+    setdefault rather than assignment, so pointing the agent at a different
+    project or region by setting these explicitly still wins.
+    """
+    if not settings.project_id:
+        return
+    os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
+    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", settings.project_id)
+    os.environ.setdefault("GOOGLE_CLOUD_LOCATION", settings.vertex_location)
+
+
+configure_agent_env()

@@ -1,11 +1,60 @@
-fastapi==0.115.6
+# Pinned exactly, because this file is the container build. An unpinned line
+# means the image deployed next month is not the image that was tested.
+#
+# The OpenTelemetry versions below are a matched set, not independent choices.
+# Read the note at the bottom before changing any of them.
+
+# --- web ---
+fastapi==0.136.3
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
+
+# --- data ---
 SQLAlchemy==2.0.36
+# Pure Python Postgres driver, which is why the image needs no libpq and no
+# compiler. Swapping it for psycopg2 means adding both.
 pg8000==1.31.2
 openpyxl==3.1.5
-pydantic==2.10.4
+# Approval package export. Pure Python, no system libraries.
+python-docx==1.2.0
+
+# --- google cloud ---
 google-cloud-documentai==3.2.0
 google-cloud-storage==2.19.0
-google-genai==1.2.0
-google-adk==1.2.1
+google-genai==2.20.0
+google-adk==1.36.2
+
+# --- telemetry ---
+opentelemetry-api==1.41.0
+opentelemetry-sdk==1.41.0
+opentelemetry-exporter-gcp-trace==1.15.0
+opentelemetry-resourcedetector-gcp==1.14.0
+opentelemetry-exporter-gcp-logging==1.12.0a0
+opentelemetry-instrumentation-fastapi==0.62b0
+opentelemetry-instrumentation-sqlalchemy==0.62b0
+opentelemetry-instrumentation-requests==0.62b0
+
+# Why these versions and not others:
+#
+# opentelemetry-api / -sdk 1.41.0 and the -instrumentation-* 0.62b0 packages
+#   are one release train. The instrumentation packages pin each other with ==,
+#   so bumping one alone does not resolve. google-adk 1.36.2 additionally caps
+#   api and sdk at <=1.41.1, so 1.41.0 is at the top of what it allows.
+#
+# opentelemetry-exporter-gcp-logging has no stable release at all - only
+#   pre-releases - so the a0 suffix is deliberate rather than an accident. An
+#   unpinned line installs it only because pip falls back to a pre-release when
+#   nothing stable exists, which is not a property worth depending on.
+#   google-adk caps it at <=1.12.0a0. Needed only when OTEL_LOGS_EXPORT=1, but
+#   pinned regardless so the build does not vary with that setting.
+#
+# opentelemetry-exporter-gcp-trace 1.15.0 requires resourcedetector-gcp <1.15,
+#   which is why the detector is pinned rather than left to resolve.
+#
+# google-adk pulls the three gcp exporters in itself. They are listed here
+#   anyway because app/telemetry.py imports them directly, and a dependency you
+#   import should be a dependency you declare.
+#
+# Dropped: opentelemetry-instrumentation-logging. Nothing imported it - log
+#   correlation comes from the formatter in app/main.py, which reads the span
+#   context directly.

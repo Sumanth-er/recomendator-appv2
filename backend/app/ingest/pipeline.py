@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .. import telemetry
 from ..models import (
     ComplianceRequirement, Quote, QuoteDiscount, QuoteLine, SourceDocument,
     Supplier,
@@ -118,14 +119,19 @@ def process_document(session: Session, document_id: str) -> None:
         content = storage.download_bytes(document.gcs_uri)
 
         # --- Stage 1: Document AI ---
-        extracted = docai.extract(content)
+        with telemetry.tracer().start_as_current_span("docai.extract") as span:
+            extracted = docai.extract(content)
+            span.set_attribute("docai.page_count", extracted.get("page_count") or 0)
+            span.set_attribute("docai.unmapped_types",
+                               len(extracted.get("unmapped_types") or []))
         document.page_count = extracted.get("page_count")
         document.docai_raw_gcs_uri = storage.upload_json(
             f"raw/{document.comparison_id}/{document_id}.json", extracted)
         session.commit()
 
         # --- Stage 2: Gemini normalization ---
-        normalized = normalize_quote(extracted)
+        with telemetry.tracer().start_as_current_span("gemini.normalize") as span:
+            normalized = normalize_quote(extracted)
         requirements = [
             {"code": r.code, "label": r.label, "match_hint": r.match_hint}
             for r in session.scalars(select(ComplianceRequirement))
@@ -213,7 +219,8 @@ def process_document(session: Session, document_id: str) -> None:
         session.refresh(quote)
 
         # --- Stage 3: automated validation ---
-        validate_quote(session, quote)
+        with telemetry.tracer().start_as_current_span("validate.quote"):
+            validate_quote(session, quote)
 
         document.status = "READY"
         document.error_detail = None
@@ -221,6 +228,7 @@ def process_document(session: Session, document_id: str) -> None:
         log.info("document %s ready, supplier %s", document_id, supplier.supplier_id)
 
     except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+        telemetry.record_exception(exc)
         session.rollback()
         document = session.get(SourceDocument, document_id)
         if document:

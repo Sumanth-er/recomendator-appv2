@@ -7,10 +7,13 @@ deployment configured this way.
 """
 from __future__ import annotations
 
+from .. import telemetry
+
 import logging
 
 from fastapi import (
-    APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile,
+    APIRouter, BackgroundTasks, Depends, File, HTTPException, Response,
+    UploadFile,
 )
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -30,6 +33,41 @@ from ..models import (
     SourceDocument, Supplier,
 )
 
+def _process_in_background(document_id: str, parent_ctx=None) -> None:
+    """Extraction, outside the request that triggered it.
+
+    The upload response has already gone back to the browser by the time this
+    runs, so this work gets its own trace rather than a child span. The link
+    back to the uploading request is what joins the two in Trace Explorer.
+
+    The flush is not optional: Cloud Run throttles CPU once a response has been
+    sent, which is exactly the window this task runs in, and a batch processor
+    waiting on its five second timer would never get the CPU to send.
+    """
+    links = None
+    try:
+        from opentelemetry.trace import Link
+
+        if parent_ctx is not None and parent_ctx.is_valid:
+            links = [Link(parent_ctx)]
+    except Exception:  # noqa: BLE001 - tracing must not break ingestion
+        links = None
+
+    try:
+        with telemetry.tracer().start_as_current_span(
+            "ingest.process_document",
+            links=links,
+            attributes={"document.id": document_id},
+        ):
+            try:
+                with SessionLocal() as session:
+                    process_document(session, document_id)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.record_exception(exc)
+                raise
+    finally:
+        telemetry.flush()
+
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
@@ -44,13 +82,6 @@ class ComparisonCreate(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
-
-
-def _process_in_background(document_id: str) -> None:
-    """Runs outside the request so the browser is not held open through
-    Document AI and Gemini."""
-    with SessionLocal() as session:
-        process_document(session, document_id)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +163,51 @@ def get_comparison(comparison_id: str, session: Session = Depends(get_session)):
     }
 
 
+@router.delete("/comparisons/{comparison_id}")
+def delete_comparison(comparison_id: str, session: Session = Depends(get_session)):
+    """Remove a comparison and everything that hangs off it.
+
+    The ORM cascade covers documents, and through them quotes, quote lines and
+    discounts. It does not cover evaluation runs or approval packages: those
+    reference the comparison by id without a relationship, so they have to go
+    explicitly and in that order, or the run rows are left pointing at a
+    comparison that no longer exists.
+
+    The source PDFs in Cloud Storage are deliberately left alone. Deleting a
+    row is recoverable from a backup; deleting the supplier's original document
+    is not, and nothing in this POC needs the bucket to stay tidy.
+    """
+    comparison = session.get(Comparison, comparison_id)
+    if not comparison:
+        raise HTTPException(404, "comparison not found")
+
+    run_ids = [
+        r.run_id for r in session.scalars(
+            select(EvaluationRun).where(
+                EvaluationRun.comparison_id == comparison_id))
+    ]
+    packages = 0
+    if run_ids:
+        packages = session.query(ApprovalPackage).filter(
+            ApprovalPackage.run_id.in_(run_ids)).delete(synchronize_session=False)
+    runs = session.query(EvaluationRun).filter(
+        EvaluationRun.comparison_id == comparison_id).delete(
+            synchronize_session=False)
+
+    documents = len(comparison.documents)
+    session.delete(comparison)
+    session.commit()
+
+    log.info("deleted comparison %s: %d documents, %d runs, %d packages",
+             comparison_id, documents, runs, packages)
+    return {
+        "deleted": comparison_id,
+        "documents": documents,
+        "runs": runs,
+        "packages": packages,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Documents
 # ---------------------------------------------------------------------------
@@ -143,6 +219,11 @@ async def upload_documents(
     files: list[UploadFile] = File(...),
     session: Session = Depends(get_session),
 ):
+
+    # Captured here, while the request span is still current, so the
+    # background task can link back to the upload that started it.
+    ctx = telemetry.current_span_context()
+
     comparison = session.get(Comparison, comparison_id)
     if not comparison:
         raise HTTPException(404, "comparison not found")
@@ -190,7 +271,8 @@ async def upload_documents(
         )
         session.commit()
 
-        background.add_task(_process_in_background, document.document_id)
+        # background.add_task(_process_in_background, document.document_id)
+        background.add_task(_process_in_background, document.document_id, ctx)
         accepted.append({
             "document_id": document.document_id,
             "filename": document.original_filename,
@@ -234,6 +316,18 @@ def get_quote(quote_id: str, session: Session = Depends(get_session)):
         raise HTTPException(404, "quote not found")
     supplier = session.get(Supplier, quote.supplier_id)
 
+    # CAS is the match key, but a bare CAS number is not something a buyer
+    # reads. The dashboard resolves the catalogue name through the engine;
+    # this screen has to do its own lookup, or it shows 7664-93-9 where the
+    # rest of the app says Sulfuric Acid 98%. A line whose CAS is outside the
+    # basket resolves to None and is left as the CAS alone, which is the
+    # honest answer - the validator already flags it.
+    material_names = {
+        m.cas_no: m.name for m in session.scalars(
+            select(Material).where(
+                Material.cas_no.in_([l.cas_no for l in quote.lines if l.cas_no])))
+    } if quote.lines else {}
+
     return {
         "quote_id": quote.quote_id,
         "supplier_name": supplier.short_name if supplier else quote.supplier_id,
@@ -261,6 +355,10 @@ def get_quote(quote_id: str, session: Session = Depends(get_session)):
             {
                 "line_no": line.line_no,
                 "cas_no": line.cas_no,
+                # The catalogue name for the CAS, when it is a material we
+                # buy. The supplier's own wording stays in its own field -
+                # it is display only and never matched on.
+                "material_name": material_names.get(line.cas_no),
                 "supplier_description": line.supplier_description,
                 "quantity": float(line.quantity) if line.quantity else None,
                 "uom": line.uom,
@@ -312,18 +410,41 @@ def get_run(run_id: str, session: Session = Depends(get_session)):
 # ---------------------------------------------------------------------------
 
 @router.post("/runs/{run_id}/package")
-async def create_package(run_id: str, session: Session = Depends(get_session)):
+async def create_package(
+    run_id: str,
+    use_agent: bool = False,
+    session: Session = Depends(get_session),
+):
+    """Draft the approval package for this run.
+
+    Deterministic by default. The package is a signed document of exact
+    figures - ten numbered sections, seven tables - and the Word file that
+    downloads is rendered from the same structure. Letting a model paraphrase
+    it would put a different set of words on screen than in the file that gets
+    approved, over numbers that have to agree with the dashboard.
+
+    use_agent=true gives the model-written version instead, which reads better
+    and is worth having when someone wants prose rather than a form. It is not
+    the default because it cannot be guaranteed to match the download.
+    """
     run = session.get(EvaluationRun, run_id)
     if not run:
         raise HTTPException(404, "run not found")
 
-    from ..agent.agent import draft_memo
+    if use_agent:
+        from ..agent.agent import draft_memo
 
-    summary = await draft_memo(run_id)
+        summary = await draft_memo(run_id)
+    else:
+        from ..render.memo import render_memo
+
+        summary = render_memo(run_id)
+
     package = ApprovalPackage(run_id=run_id, summary_md=summary)
     session.add(package)
     session.commit()
-    return {"package_id": package.package_id, "summary_md": summary}
+    return {"package_id": package.package_id, "summary_md": summary,
+            "source": "agent" if use_agent else "engine"}
 
 
 @router.get("/runs/{run_id}/package")
@@ -340,6 +461,40 @@ def get_package(run_id: str, session: Session = Depends(get_session)):
         "summary_md": package.summary_md,
         "status": package.status,
     }
+
+
+@router.get("/runs/{run_id}/package.docx")
+def download_package(run_id: str, session: Session = Depends(get_session)):
+    """The approval package as a Word document.
+
+    Rendered from the stored run rather than from the agent's prose, so the
+    file that gets signed carries the same figures the dashboard shows. The
+    filename is dated because these get mailed around and filed.
+    """
+    run = session.get(EvaluationRun, run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+
+    try:
+        from ..render.docx import render_docx
+
+        content = render_docx(run_id)
+    except ImportError as exc:  # python-docx missing from the image
+        raise HTTPException(
+            501, "Word export is unavailable: python-docx is not installed"
+        ) from exc
+
+    if content is None:
+        raise HTTPException(404, "run not found")
+
+    stamp = run.created_at.strftime("%Y-%m-%d") if run.created_at else "undated"
+    filename = f"Sourcing_Approval_Package_{stamp}.docx"
+    return Response(
+        content=content,
+        media_type=("application/vnd.openxmlformats-officedocument"
+                    ".wordprocessingml.document"),
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/runs/{run_id}/ask")

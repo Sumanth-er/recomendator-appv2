@@ -38,6 +38,12 @@ def evaluate(
     incumbent_spend: dict[str, Decimal] | None = None,
     engine_version: str = "1.0.0",
 ) -> dict:
+    # One clock reading for the whole run. Expiry is measured against it rather
+    # than against "now", so a stored run keeps saying what it said when it was
+    # evaluated - the same reason the thresholds are snapshotted.
+    generated_at = datetime.now(timezone.utc)
+    run_date = generated_at.date()
+
     historical = historical or {}
     incumbent_spend = incumbent_spend or {}
     incumbent_total = sum(incumbent_spend.values()) if incumbent_spend else ZERO
@@ -189,6 +195,12 @@ def evaluate(
             "discount_condition_text": discount_text,
             "discount_amount_eur": discount_amount,
             "total_landed_cost_eur": total,
+            "quote_date": quote.quote_date.isoformat() if quote.quote_date else None,
+            "valid_until": quote.valid_until.isoformat() if quote.valid_until else None,
+            "days_to_expiry": (
+                (quote.valid_until - run_date).days if quote.valid_until else None),
+            "is_expired": (
+                bool(quote.valid_until and quote.valid_until < run_date)),
             "payment_terms_net_days": quote.payment_terms_net_days,
             "lead_time_min_weeks": dstr(quote.lead_time_min_weeks),
             "lead_time_max_weeks": dstr(quote.lead_time_max_weeks),
@@ -371,6 +383,23 @@ def evaluate(
         for row in line_rows if row["data_quality_flag"] != "OK"
     ]
 
+    # ---- Quote validity: an expired quote is still ranked, but flagged ----
+    # The price is what the supplier put in writing, so it stays in the
+    # comparison. Whether they will still honour it is a question for the
+    # buyer, not something the engine should answer by dropping the line.
+    for row in supplier_rows:
+        if row.get("is_expired"):
+            warnings.append(
+                f"{row['supplier_name']}'s quote expired on {row['valid_until']} "
+                f"({abs(row['days_to_expiry'])} days before this run); the price "
+                "may need reconfirming before award"
+            )
+        elif row.get("days_to_expiry") is not None and row["days_to_expiry"] <= 14:
+            warnings.append(
+                f"{row['supplier_name']}'s quote is valid until "
+                f"{row['valid_until']}, {row['days_to_expiry']} days from this run"
+            )
+
     # ---- Spec 2.3: quoting suppliers must be on the approved list ----
     for row in supplier_rows:
         if not row.get("is_approved_supplier"):
@@ -414,7 +443,7 @@ def evaluate(
 
     return {
         "engine_version": engine_version,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at.isoformat(),
         "kpis": kpis,
         "ceiling_equivalent_total_eur": str(ceiling_equiv),
         "suppliers": sorted(

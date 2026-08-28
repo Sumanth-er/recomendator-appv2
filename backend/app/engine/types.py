@@ -7,6 +7,7 @@ makes it testable in isolation and reproducible run to run.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 
 
@@ -90,6 +91,11 @@ class QuoteInput:
     lead_time_max_weeks: Decimal | None
     lines: tuple[LineInput, ...]
     discounts: tuple[DiscountInput, ...] = ()
+    # Traceability only - the dashboard shows when a quote was issued and how
+    # long it stands. Nothing in the engine ranks on either, so both default to
+    # None and a quote that omits them still evaluates.
+    quote_date: date | None = None
+    valid_until: date | None = None
     # From the category strategy's approved supplier list (spec 2.3)
     is_approved: bool = True
     # {code: {"claimed": bool, "evidence_text": str|None, "evidence_page": int|None}}
