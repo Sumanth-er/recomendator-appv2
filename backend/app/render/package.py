@@ -226,10 +226,14 @@ def build_package(run_id: str) -> dict | None:
 def _executive_summary(result, kpis, suppliers, primary, secondary,
                        not_recommended, policy, ctx) -> dict:
     names = ", ".join(s["supplier_name"] for s in suppliers)
+    # No site is configured unless PLANT_NAME is set, so the destination
+    # clause drops out rather than printing a placeholder.
+    plant = ctx.get("plant") or "-"
+    destination = f" for delivery to {plant}" if plant != "-" else ""
     blocks = [
         para(f"Sourcing event summary: {kpis.get('supplier_count', 0)} quotations "
-             f"received covering {kpis.get('material_count', 0)} materials for "
-             f"delivery to {ctx['plant']}. Suppliers quoting: {names}."),
+             f"received covering {kpis.get('material_count', 0)} materials"
+             f"{destination}. Suppliers quoting: {names}."),
         para(f"Sourcing objective: secure the required volumes at the lowest total "
              f"landed cost while maintaining SEMI-grade compliance and keeping no "
              f"single vendor above "
@@ -581,12 +585,18 @@ def _strategy_alignment(suppliers, lines, gates, primary, secondary, policy,
 # ---------------------------------------------------------------------------
 
 def _negotiation(result, primary, policy) -> dict:
-    candidates = result.get("renegotiation") or []
-    suppliers = result.get("suppliers") or []
+    # Only the suppliers actually being awarded. A supplier excluded at a gate
+    # is not someone the buyer is going back to the table with, so listing its
+    # over-ceiling lines here reads as work to do rather than a closed question.
+    awarded = {s["supplier_id"] for s in (result.get("suppliers") or [])
+               if s.get("award_status") in ("PRIMARY", "SECONDARY")}
+    candidates = [c for c in (result.get("renegotiation") or [])
+                  if c["supplier_id"] in awarded]
 
     if not candidates:
-        blocks = [para("No line item is priced above its category strategy "
-                       "ceiling. There is no repricing requirement before award.")]
+        blocks = [para("No line item from an awarded supplier is priced above "
+                       "its category strategy ceiling. There is no repricing "
+                       "requirement before award.")]
         return {"number": 7, "title": "Negotiation Opportunities", "blocks": blocks}
 
     rows = []
@@ -605,18 +615,6 @@ def _negotiation(result, primary, policy) -> dict:
             f"{signed(row['gap_pct'])} vs ceiling EUR {row['ceiling_price_eur_l']}/L",
             f"EUR {eur(row['annual_impact_eur'])} annual impact",
         ])
-
-    # A supplier whose whole basket is over the ceiling-equivalent is a
-    # repricing conversation, not a line-item one.
-    for supplier in suppliers:
-        variance = dec(supplier.get("ceiling_equivalent_variance_pct"))
-        if variance is not None and variance > 0 and not supplier.get("eligible"):
-            rows.append([
-                "All quoted items",
-                supplier["supplier_name"],
-                f"{signed(variance)} vs ceiling-equivalent basket total",
-                "Not viable for full award without significant repricing",
-            ])
 
     blocks = [table(
         ["Item", "Supplier", "Gap vs. Ceiling / Benchmark", "Opportunity"], rows)]

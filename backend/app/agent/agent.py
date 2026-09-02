@@ -7,7 +7,9 @@ conclusion.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 
 from .. import telemetry
 from ..config import settings
@@ -16,6 +18,15 @@ from .tools import ALL_TOOLS
 log = logging.getLogger(__name__)
 
 APP_NAME = "sourcing-agent"
+
+# How long the agent gets before the deterministic answer is used instead.
+#
+# An agent turn is several LLM round trips and a tool call each; when one of
+# those stalls there is nothing to stop it, and the request sits open until
+# nginx (300s) or Cloud Run cuts the connection - which reaches the browser as
+# "Failed to fetch" with no answer at all. Falling back at a budget well inside
+# those limits turns that into a correct, if less fluent, reply.
+AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))
 
 INSTRUCTION = """You are a procurement analyst explaining a completed supplier
 quote evaluation to a buyer at a semiconductor plant.
@@ -145,22 +156,32 @@ async def _ask(instruction: str, prompt: str, operation: str, run_id: str) -> st
             },
         )
 
-        runner = InMemoryRunner(agent=build_agent(instruction), app_name=APP_NAME)
-        session = await runner.session_service.create_session(
-            app_name=APP_NAME, user_id="buyer")
+        # A runner per call, closed when the call ends. InMemoryRunner builds a
+        # session, artifact and memory service of its own each time, and the
+        # session holds the whole conversation - this instruction, every tool
+        # result, the model's replies. Without close() those services keep that
+        # alive after the answer has been sent, which on a warm Cloud Run
+        # instance accumulates until the container is killed mid-request and the
+        # browser sees a dropped connection rather than an error.
+        async with InMemoryRunner(agent=build_agent(instruction),
+                                  app_name=APP_NAME) as runner:
+            session = await runner.session_service.create_session(
+                app_name=APP_NAME, user_id="buyer")
 
-        chunks: list[str] = []
-        async for event in runner.run_async(
-            user_id="buyer",
-            session_id=session.id,
-            new_message=types.Content(role="user", parts=[types.Part(text=prompt)]),
-        ):
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if getattr(part, "text", None):
-                        chunks.append(part.text)
+            chunks: list[str] = []
+            async for event in runner.run_async(
+                user_id="buyer",
+                session_id=session.id,
+                new_message=types.Content(
+                    role="user", parts=[types.Part(text=prompt)]),
+            ):
+                if event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if getattr(part, "text", None):
+                            chunks.append(part.text)
 
-        answer = "".join(chunks).strip()
+            answer = "".join(chunks).strip()
+
         telemetry.set_attributes(span, **{"gen_ai.response.length": len(answer)})
         return answer
 
@@ -179,13 +200,26 @@ def _agent_failed(operation: str, exc: Exception) -> None:
     log.exception("agent %s failed, falling back to the stored trail", operation)
 
 
+def _agent_timed_out(operation: str) -> None:
+    """A stall, recorded as one - distinct from the agent refusing or erroring."""
+    telemetry.record_exception(
+        TimeoutError(f"agent {operation} exceeded {AGENT_TIMEOUT_SECONDS}s"))
+    log.warning("agent %s exceeded its %.0fs budget; answering from the stored "
+                "run instead", operation, AGENT_TIMEOUT_SECONDS)
+
+
 async def explain(run_id: str, question: str) -> str:
     prompt = (
         f"The evaluation run id is {run_id}. Use your tools against that run id "
         f"to answer this question from the buyer:\n\n{question}"
     )
     try:
-        return await _ask(INSTRUCTION, prompt, "explain", run_id)
+        return await asyncio.wait_for(
+            _ask(INSTRUCTION, prompt, "explain", run_id),
+            timeout=AGENT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        _agent_timed_out("explain")
+        return fallback_explanation(run_id)
     except Exception as exc:  # noqa: BLE001 - fall back rather than fail the request
         _agent_failed("explain", exc)
         return fallback_explanation(run_id)
@@ -202,7 +236,14 @@ async def draft_memo(run_id: str) -> str:
         f"tools and write the approval package summary."
     )
     try:
-        return await _ask(MEMO_INSTRUCTION, prompt, "draft_memo", run_id)
+        return await asyncio.wait_for(
+            _ask(MEMO_INSTRUCTION, prompt, "draft_memo", run_id),
+            timeout=AGENT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        _agent_timed_out("draft_memo")
+        from ..render.memo import render_memo
+
+        return render_memo(run_id)
     except Exception as exc:  # noqa: BLE001
         _agent_failed("draft_memo", exc)
         from ..render.memo import render_memo

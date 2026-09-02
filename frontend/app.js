@@ -31,7 +31,18 @@ function toast(message) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(API + path, options);
+  let response;
+  try {
+    response = await fetch(API + path, options);
+  } catch (err) {
+    // fetch only rejects when no response arrived at all - the connection was
+    // refused, dropped or timed out. The browser's own wording for that is
+    // "Failed to fetch", which tells the reader nothing about which request
+    // died or what to do next.
+    throw new Error(
+      `Could not reach the server on ${path}. The request may have taken too `
+      + `long, or the service restarted. Try again — nothing was saved.`);
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail || `${response.status} ${response.statusText}`);
@@ -330,109 +341,6 @@ async function showExtracted(quoteId) {
 
 /* --------------------------------------------------------------- dashboard */
 
-async function run(runId) {
-  const data = await api(`/runs/${runId}`);
-  const r = data.result;
-  const k = r.kpis;
-
-  view.innerHTML = `
-    <div class="spread">
-      <div><h1>Quote comparison dashboard</h1>
-        <p class="muted small">Engine ${esc(r.engine_version)} · generated ${esc((r.generated_at || "").slice(0, 16).replace("T", " "))} ·
-        run ${esc(runId.slice(0, 8))}</p></div>
-      <div class="row">
-        <a href="#/comparison/${esc(data.comparison_id)}" class="muted small">Back to batch</a>
-        <button class="primary" id="package-btn">Approval package</button>
-      </div>
-    </div>
-
-    ${(k.unapproved_suppliers || []).length ? `<div class="banner bad">
-      Not on the approved supplier list for this category:
-      ${esc(k.unapproved_suppliers.join(", "))}.</div>` : ""}
-
-    ${(r.warnings || []).length ? `<div class="banner warn">
-      ${r.warnings.map(esc).join("<br>")}</div>` : ""}
-
-    <div class="kpis">
-      <div class="kpi"><div class="label">Recommended supplier</div>
-        <div class="value">${esc(k.recommended_supplier || "none")}</div>
-        <div class="note"><span class="unit">EUR</span> ${eur(k.recommended_total_eur)} total landed</div></div>
-      <div class="kpi"><div class="label">Spread across suppliers</div>
-        <div class="value"><span class="unit">EUR</span> ${eur(k.spread_eur)}</div>
-        <div class="note">${esc(k.spread_pct)}% of total basket value</div></div>
-      <div class="kpi"><div class="label">Ceiling-equivalent basket</div>
-        <div class="value"><span class="unit">EUR</span> ${eur(k.ceiling_equivalent_total_eur)}</div>
-        <div class="note">every item at its ceiling price</div></div>
-      <div class="kpi"><div class="label">Negotiation opportunities</div>
-        <div class="value">${k.renegotiation_count} <span class="unit">${k.renegotiation_count === 1 ? "line" : "lines"}</span></div>
-        <div class="note">priced above the category ceiling</div></div>
-      <div class="kpi"><div class="label">Data quality flags</div>
-        <div class="value">${k.data_quality_issues} <span class="unit">${k.data_quality_issues === 1 ? "flag" : "flags"}</span></div>
-        <div class="note">flagged, not corrected</div></div>
-    </div>
-
-    <h2>Supplier summary</h2>
-    <div class="card">
-      <div class="scroll">
-      <table><thead><tr>
-        <th>Rank</th><th>Supplier</th><th class="num">Goods (EUR)</th>
-        <th class="num">Freight (EUR)</th>
-        <th class="num">Discount (EUR)</th><th class="num">Total landed (EUR)</th>
-        <th>Incoterm</th><th>Payment</th><th>Lead time</th>
-        <th>Quote date</th><th>Valid until</th><th>Status</th>
-      </tr></thead><tbody>
-      ${r.suppliers.map((s) => `<tr>
-        <td>${s.final_rank ?? "-"}</td>
-        <td><strong>${esc(s.supplier_name)}</strong></td>
-        <td class="num">${eur(s.goods_subtotal_eur)}</td>
-        <td class="num">${eur(s.freight_amount_eur)}<div class="derived ${s.freight_policy_matched === false ? "above" : ""}"
-          title="${esc(s.freight_basis || "")}">${s.freight_policy_matched === false
-            ? "no policy for " + esc(s.incoterm || "missing Incoterm")
-            : esc(s.freight_adj_pct) + "% fixed"}</div></td>
-        <td class="num">${s.discount_amount_eur !== "0.00" ? "-" + eur(s.discount_amount_eur) : "-"}
-          ${s.discount_condition_met ? `<div class="derived">${esc(s.discount_pct_applied)}%</div>` : ""}</td>
-        <td class="num"><strong>${eur(s.total_landed_cost_eur)}</strong></td>
-        <td>${esc(s.incoterm || "-")}</td>
-        <td>${s.payment_terms_net_days ? "Net " + s.payment_terms_net_days : "-"}</td>
-        <td>${s.lead_time_min_weeks ?? "-"}-${s.lead_time_max_weeks ?? "-"} wks</td>
-        <td>${esc(s.quote_date || "-")}</td>
-        <td>${esc(s.valid_until || "-")}${validityNote(s)}</td>
-        <td><span class="pill ${s.award_status === "PRIMARY" ? "ok"
-          : s.award_status === "SECONDARY" ? "info" : "warn"}">${esc((s.award_status || "").toLowerCase().replace("_", " "))}</span></td>
-      </tr>`).join("")}
-      </tbody></table>
-      </div>
-      ${primaryRationale(r)}
-      <p class="small muted" style="margin-top:10px">All amounts in EUR. Freight is a fixed adjustment selected by Incoterm, not a quoted figure.
-      Totals are extended from landed prices using required volumes.</p>
-      </div>
-
-    ${lineMatrix(r)}
-    ${commercialTermsPanel(r)}
-    ${compliancePanel(r)}
-    ${concentrationPanel(r)}
-    ${gateTrail(r)}
-    ${promotionPanel(r)}
-    ${renegotiationPanel(r)}
-    ${dataQualityPanel(r)}
-
-    <h2>Ask about this recommendation</h2>
-    <div class="card">
-      <div class="row">
-        <input type="text" id="question" style="flex:1;min-width:320px"
-          placeholder="Why is the recommended supplier ranked above the cheaper one?">
-        <button id="ask-btn">Ask</button>
-      </div>
-      <div class="row small" style="margin-top:10px" id="suggested"></div>
-      <div id="answer" style="margin-top:14px"></div>
-    </div>`;
-
-  wireAgent(runId, r);
-  document.getElementById("package-btn").onclick = () => {
-    location.hash = `#/run/${runId}/package`;
-  };
-}
-
 /* Validity on the extraction screen, where there is no run yet to measure
  * against. This one is against today on purpose: nothing has been evaluated,
  * so the only useful question is whether the quote is still good now. */
@@ -445,124 +353,199 @@ function expiryPill(validUntil) {
   return "";
 }
 
-/* Quote validity. The engine measured this against the run's own date, not
- * against today, so an old run keeps reading the way it did when it was
- * evaluated rather than turning red as the page ages. */
-function validityNote(s) {
-  if (s.is_expired) {
-    return `<div class="derived above" title="already expired when this run was evaluated">expired</div>`;
-  }
-  if (s.days_to_expiry != null && s.days_to_expiry <= 14) {
-    return `<div class="derived">${s.days_to_expiry} days left</div>`;
-  }
-  return "";
+/* ------------------------------------------------------------- dashboard */
+/*
+ * Every figure below is a value the engine already stored on the run. The only
+ * thing fetched separately is the prose, and it arrives after the page has
+ * rendered - each slot carries data-note and is filled in place, so a slow or
+ * unavailable model leaves blank captions rather than an empty dashboard.
+ */
+
+const NOTE_CACHE = {};
+
+function noteSlot(key, cls) {
+  return `<p class="note-slot ${cls || ""}" data-note="${esc(key)}"></p>`;
 }
 
-/* Why rank 1 won, shown under the table it refers to rather than in a card of
- * its own. Every value here was stored by the engine: the promotion rule fired
- * if and only if the base rank by cost was not already 1. */
-function primaryRationale(r) {
-  const top = r.suppliers.find((s) => s.final_rank === 1);
-  if (!top) return "";
-  const promoted = top.base_rank && top.base_rank !== top.final_rank;
-  const beaten = promoted
-    ? r.suppliers.find((s) => s.supplier_id === top.promoted_over)
-    : null;
+async function fillNotes(runId) {
+  let payload = NOTE_CACHE[runId];
+  if (!payload) {
+    try {
+      payload = await api(`/runs/${runId}/notes`);
+      NOTE_CACHE[runId] = payload;
+    } catch {
+      return;                       // captions stay blank; nothing else changes
+    }
+  }
+  const n = (payload && payload.notes) || {};
+  const at = (path) => path.split(".").reduce((o, k) => (o || {})[k], n) || "";
 
+  document.querySelectorAll("[data-note]").forEach((el) => {
+    const key = el.dataset.note;
+    let text = "";
+    if (key.startsWith("supplier:")) {
+      const id = key.slice(9);
+      text = ((n.suppliers || []).find((s) => s.supplier_id === id) || {}).note || "";
+    } else if (key.startsWith("nego:")) {
+      const cas = key.slice(5);
+      text = ((n.negotiation || []).find((x) => x.cas_no === cas) || {}).note || "";
+    } else {
+      text = at(key);
+    }
+    if (text) { el.textContent = text; el.classList.add("filled"); }
+  });
+
+  const align = document.getElementById("alignment-list");
+  if (align && (n.alignment || []).length) {
+    align.innerHTML = n.alignment.map((a) => `
+      <div class="align-item">
+        <span class="align-tick">&check;</span>
+        <div><strong>${esc(a.title)}</strong>
+        <p class="small muted">${esc(a.detail || "")}</p></div>
+      </div>`).join("");
+  }
+}
+
+/* --- small derivations, all from stored values ---------------------------- */
+
+const isAwarded = (s) => s.award_status === "PRIMARY" || s.award_status === "SECONDARY";
+
+function gapToCheapest(r) {
+  const primary = r.suppliers.find((s) => s.final_rank === 1);
+  const cheapest = r.suppliers.reduce((a, b) =>
+    Number(a.total_landed_cost_eur) <= Number(b.total_landed_cost_eur) ? a : b, r.suppliers[0]);
+  if (!primary || !cheapest || primary.supplier_id === cheapest.supplier_id) return null;
+  const low = Number(cheapest.total_landed_cost_eur);
+  return { pct: ((Number(primary.total_landed_cost_eur) - low) / low * 100).toFixed(1),
+           primary, cheapest };
+}
+
+const aboveCount = (r, s) => r.lines.filter(
+  (l) => l.supplier_id === s.supplier_id && l.above_ceiling).length;
+const quotedCount = (r, s) => r.lines.filter((l) => l.supplier_id === s.supplier_id).length;
+
+const STATUS_LABEL = {
+  PRIMARY: "Primary award", SECONDARY: "Secondary / dual-source",
+  NOT_RECOMMENDED: "Not recommended", EXCLUDED: "Not recommended",
+};
+
+/* --- sections ------------------------------------------------------------- */
+
+function kpiRow(r) {
+  const k = r.kpis;
+  const gap = gapToCheapest(r);
+  const primary = r.suppliers.find((s) => s.final_rank === 1);
   return `
-    <div class="rationale">
-      <h3>Why ${esc(top.supplier_name)} is ranked 1</h3>
-      <p>${esc(top.primary_reason || "")}</p>
-      <p class="small muted">${promoted
-        ? `Base rank by cost was ${top.base_rank}. The promotion rule moved it above
-           ${esc(beaten ? beaten.supplier_name : (top.promoted_over || "the cheaper supplier"))},
-           which needs all four of its conditions to hold independently — each one is
-           shown in the promotion rule panel below.`
-        : `Lowest total landed cost at EUR ${eur(top.total_landed_cost_eur)},
-           after passing all three gates.`}
-      </p>
+    <div class="kpis">
+      <div class="kpi feature">
+        <div class="label">Recommended supplier</div>
+        <div class="value">${esc(k.recommended_supplier || "none")}</div>
+        ${noteSlot("headline.recommendation", "lead")}
+        ${noteSlot("headline.why")}
+      </div>
+      <div class="kpi">
+        <div class="label">Gap to the cheapest bid</div>
+        <div class="value">${gap ? gap.pct + "%" : "—"}</div>
+        <div class="sub">${gap
+          ? esc(gap.primary.supplier_name) + " vs " + esc(gap.cheapest.supplier_name)
+          : "the recommended supplier is also the cheapest"}</div>
+        ${noteSlot("kpi_notes.gap")}
+      </div>
+      <div class="kpi">
+        <div class="label">Where it sits vs. ceiling price</div>
+        <div class="value">${primary ? esc(primary.ceiling_equivalent_variance_pct) + "%" : "—"}</div>
+        <div class="sub">against a ceiling-equivalent basket of
+          <span class="unit">EUR</span> ${eur(k.ceiling_equivalent_total_eur)}</div>
+        ${noteSlot("kpi_notes.target")}
+      </div>
+      <div class="kpi">
+        <div class="label">Savings on the table</div>
+        <div class="value"><span class="unit">EUR</span> ${eur(k.spread_eur)}</div>
+        <div class="sub">cheapest quote against the most expensive</div>
+        ${noteSlot("kpi_notes.savings")}
+      </div>
     </div>`;
 }
 
-function lineMatrix(r) {
-  const suppliers = r.suppliers.map((s) => s.supplier_id);
+function rankingCards(r) {
+  // Ranked suppliers keep the engine's number. The rest follow, ordered by
+  // cost - a display position only, which is why it is worked out here and
+  // never written back onto the run.
+  const ranked = r.suppliers.filter((s) => s.final_rank)
+    .sort((a, b) => a.final_rank - b.final_rank);
+  const unranked = r.suppliers.filter((s) => !s.final_rank)
+    .sort((a, b) => Number(a.total_landed_cost_eur) - Number(b.total_landed_cost_eur));
+  const ordered = [...ranked, ...unranked];
+  const position = new Map(ordered.map((s, i) => [s.supplier_id, i + 1]));
+  return `
+    <h2>Supplier ranking</h2>
+    <div class="rank-grid">
+      ${ordered.map((s) => `
+        <div class="rank-card ${s.award_status === "PRIMARY" ? "is-primary" : ""}">
+          <div class="rank-head">
+            <span class="rank-no">Rank ${position.get(s.supplier_id)}</span>
+            <span class="pill ${s.award_status === "PRIMARY" ? "ok"
+              : s.award_status === "SECONDARY" ? "info" : "warn"}">${
+              esc(STATUS_LABEL[s.award_status] || s.award_status || "")}</span>
+          </div>
+          <h3>${esc(s.supplier_name)}</h3>
+          <div class="rank-meta">${esc(s.incoterm || "—")} ·
+            ${s.payment_terms_net_days ? "Net " + s.payment_terms_net_days : "terms not stated"} ·
+            ${s.lead_time_min_weeks ?? "—"}–${s.lead_time_max_weeks ?? "—"} wks</div>
+          <div class="rank-total"><span class="unit">EUR</span> ${eur(s.total_landed_cost_eur)}</div>
+          <div class="rank-sub">total landed cost · ${aboveCount(r, s)} of ${quotedCount(r, s)} items above ceiling</div>
+          ${noteSlot("supplier:" + s.supplier_id)}
+        </div>`).join("")}
+    </div>`;
+}
+
+function methodology(r) {
+  const gateOf = (n) => Object.values(r.gates).map((g) => g[n - 1]);
+  const g1 = gateOf(1), g3 = gateOf(3);
   const names = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s.supplier_name]));
-  const materials = [...new Map(r.lines.map((l) => [l.cas_no, l])).values()];
+  const by = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s]));
 
-  const hasHistorical = r.lines.some((l) => l.historical_avg_eur_l != null);
+  // Each pill names the supplier and the figure that decided it, so the step
+  // can be checked without reading the tables further down.
+  const failed1 = Object.entries(r.gates)
+    .filter(([, g]) => !g[0].passed)
+    .map(([id, g]) => {
+      const gaps = ((g[0].detail || {}).gaps || [])
+        .filter((c) => !HIDDEN_COMPLIANCE.has(c));
+      return `${names[id]} fails${gaps.length ? " (" + gaps.join(", ") + ")" : ""}`;
+    });
+  const failed3 = Object.entries(r.gates)
+    .filter(([, g]) => !g[2].passed)
+    .map(([id]) => `${names[id]} fails (${by[id].ceiling_equivalent_variance_pct}%)`);
+  const byCost = [...r.suppliers].filter((s) => s.base_rank)
+    .sort((a, b) => a.base_rank - b.base_rank)
+    .map((s) => `${s.supplier_name} (EUR ${eur(s.total_landed_cost_eur)})`);
+  const promo = (r.promotions || []).find((p) => p.promoted);
 
-  const cell = (line) => {
-    if (!line) return `<td class="num muted">-</td>`;
-    const classes = [line.is_cheapest_for_material ? "cheapest" : "",
-                     line.above_ceiling ? "above" : ""].join(" ");
-    const variance = line.historical_variance_pct;
-    const drift = variance == null ? "" :
-      `<div class="derived ${Number(variance) > 0 ? "above" : ""}">${Number(variance) > 0 ? "+" : ""}${esc(variance)}% vs hist.</div>`;
-    return `<td class="num ${classes}" title="${esc(line.quoted_unit_price)} ${esc(line.quoted_currency)}/${esc(line.quoted_uom)} → ${esc(line.price_per_l_eur)} EUR/L → +${esc(line.freight_adj_pct)}% freight">
-      ${num(line.landed_price_per_l_eur, 2)}
-      <div class="derived">${price(line.quoted_unit_price)} ${esc(line.quoted_currency)}/${esc(line.quoted_uom)}</div>
-      ${drift}
-    </td>`;
-  };
-
-  return `
-    <h2>Landed price per litre, by material</h2>
-    <div class="card scroll">
-      <table><thead><tr>
-        <th>Material</th><th class="num">Required (L)</th>
-        <th class="num">Ceiling (EUR/L)</th>
-        ${hasHistorical ? `<th class="num">Historical avg (EUR/L)</th>` : ""}
-        ${suppliers.map((s) => `<th class="num">${esc(names[s])}<div class="unit">EUR/L landed</div></th>`).join("")}
-      </tr></thead><tbody>
-      ${materials.map((m) => `<tr>
-        <td>${esc(m.material_name)}<div class="derived">CAS ${esc(m.cas_no)}</div></td>
-        <td class="num">${num(m.required_qty_l, 0)}</td>
-        <td class="num">${num(m.ceiling_price_eur_l, 2)}</td>
-        ${hasHistorical ? `<td class="num" title="${m.historical_po_line_count
-            ? m.historical_po_line_count + " PO lines" : ""}">
-          ${num(m.historical_avg_eur_l, 2)}
-          ${m.historical_last_invoiced_eur_l
-            ? `<div class="derived">last ${num(m.historical_last_invoiced_eur_l, 2)}</div>` : ""}
-          ${m.historical_min_eur_l
-            ? `<div class="derived">${num(m.historical_min_eur_l, 2)}–${num(m.historical_max_eur_l, 2)}</div>` : ""}</td>` : ""}
-        ${suppliers.map((s) => cell(r.lines.find((l) =>
-          l.supplier_id === s && l.cas_no === m.cas_no))).join("")}
-      </tr>`).join("")}
-      </tbody></table>
-      <p class="small muted" style="margin-top:10px">
-        <span class="pill ok">shaded</span> cheapest for that material ·
-        <span class="above">red</span> above the category strategy ceiling ·
-        small text is the original quoted price and the variance against the historical
-        average. Hover a cell for the full derivation.
-        ${hasHistorical ? "" : "<br>No historical extract loaded — upload one under Policy in force to see price variance."}
-      </p>
+  const step = (n, title, noteKey, pill, tone) => `
+    <div class="step">
+      <div class="step-no">Step ${n}</div>
+      <h3>${title}</h3>
+      ${noteSlot(noteKey)}
+      <span class="pill ${tone}">${esc(pill)}</span>
     </div>`;
-}
 
-function gateTrail(r) {
   return `
-    <h2>Ranking trail</h2>
-    <p class="muted small">Gates run in order. A supplier failing an earlier gate is excluded before cost is considered.</p>
-    ${r.suppliers.map((s) => `
-      <div class="card">
-        <div class="spread">
-          <strong>${esc(s.supplier_name)}</strong>
-          <span class="pill ${s.eligible ? "ok" : "bad"}">${s.eligible
-            ? "cleared all gates" : "failed gate " + s.failed_gate}</span>
-        </div>
-        ${(r.gates[s.supplier_id] || []).map((g) => `
-          <div class="gate ${g.passed ? "pass" : "fail"}">
-            <div class="head">Gate ${g.gate_no} · ${esc(g.gate_name)} ·
-              <span class="pill ${g.passed ? "ok" : "bad"}">${g.passed ? "pass" : "fail"}</span></div>
-            <div class="small muted">${esc(g.detail.explanation || "")}</div>
-            ${g.measured_value != null ? `<div class="derived">measured ${esc(g.measured_value)} against threshold ${esc(g.threshold_value)}</div>` : ""}
-          </div>`).join("")}
-        <div class="small">
-          Base rank by cost: <strong>${s.base_rank ?? "not ranked"}</strong> ·
-          Final rank: <strong>${s.final_rank ?? "not ranked"}</strong>
-        </div>
-        <div class="small muted" style="margin-top:6px">${esc(s.primary_reason || "")}</div>
-      </div>`).join("")}`;
+    <h2>Ranking methodology</h2>
+    <div class="steps-grid">
+      ${step(1, "Compliance check", "method.compliance",
+        failed1.length ? failed1.join("; ") : `all ${g1.length} pass`,
+        failed1.length ? "warn" : "ok")}
+      ${step(2, "Ceiling-price check", "method.target_price",
+        failed3.length ? failed3.join("; ") : `all ${g3.length} within threshold`,
+        failed3.length ? "warn" : "ok")}
+      ${step(3, "Rank by cost", "method.rank",
+        byCost.length ? byCost.join(", then ") : "no supplier ranked", "info")}
+      ${step(4, "Can a pricier supplier move up?", "method.promotion",
+        promo ? `${names[promo.candidate_supplier_id] || ""} moves to Rank 1`
+                + ` (${promo.cost_gap_pct}% gap)`
+              : "no promotion", promo ? "ok" : "plain")}
+    </div>`;
 }
 
 function promotionPanel(r) {
@@ -589,173 +572,253 @@ function promotionPanel(r) {
       </div>`).join("")}`;
 }
 
-function renegotiationPanel(r) {
-  if (!(r.renegotiation || []).length) return "";
-  return `
-    <h2>Negotiation Opportunities</h2>
-    <div class="card scroll">
-      <table><thead><tr><th>Supplier</th><th>Material</th>
-        <th class="num">Landed (EUR/L)</th><th class="num">Ceiling (EUR/L)</th>
-        <th class="num">Gap (%)</th><th class="num">Annual impact (EUR)</th></tr></thead><tbody>
-      ${r.renegotiation.map((c) => `<tr>
-        <td>${esc(c.supplier_name)}</td><td>${esc(c.material_name)}</td>
-        <td class="num above">${num(c.landed_price_eur_l, 2)}</td>
-        <td class="num">${num(c.ceiling_price_eur_l, 2)}</td>
-        <td class="num">${esc(c.gap_pct)}%</td>
-        <td class="num">${eur(c.annual_impact_eur)}</td>
-      </tr>`).join("")}
-      </tbody></table>
-    </div>`;
-}
 
-function concentrationPanel(r) {
-  const hc = r.historical_context || {};
-  const vendors = hc.incumbent_vendors || [];
-  const byId = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s]));
-  const names = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s.supplier_name]));
-
-  // The primary award is not a dual-sourcing question - this panel exists to
-  // show the second source that policy requires, so the primary is stated in
-  // the footnote rather than given a row of its own.
-  const primary = (r.allocation || []).find(
-    (a) => (byId[a.supplier_id] || {}).final_rank === 1);
-  const allocation = (r.allocation || []).filter(
-    (a) => (byId[a.supplier_id] || {}).final_rank !== 1);
-
-  if (!allocation.length && !vendors.length) return "";
-
-  if (!allocation.length) {
-    return `
-      <h2>Dual sourcing and concentration</h2>
-      <div class="card">
-        <p class="muted">No second source qualified. Every other supplier was
-        excluded at a gate, so the whole basket would sit with
-        ${esc(primary ? names[primary.supplier_id] || primary.supplier_id : "one supplier")}
-        — above the ${esc(hc.concentration_threshold_pct || "60")}% concentration
-        threshold the category strategy sets.</p>
-      </div>`;
-  }
-
-  return `
-    <h2>Dual sourcing and concentration</h2>
-    <div class="card">
-      <div class="scroll">
-      <table><thead><tr><th>Second source</th><th class="num">Share today</th>
-        <th class="num">Proposed share</th><th class="num">Proposed spend (EUR)</th>
-        <th>Against the ${esc(hc.concentration_threshold_pct || "60")}% threshold</th></tr></thead>
-      <tbody>${allocation.map((a) => {
-        const today = vendors.find((v) => v.supplier_id === a.supplier_id);
-        const breachToday = today && today.exceeds_threshold_today;
-        return `<tr>
-          <td>${esc(names[a.supplier_id] || a.supplier_id)}
-            ${today ? "" : `<div class="derived">no prior spend</div>`}</td>
-          <td class="num ${breachToday ? "above" : ""}">${a.historical_share_pct == null
-            ? "<span class='muted'>-</span>" : esc(a.historical_share_pct) + "%"}</td>
-          <td class="num">${esc(a.allocation_pct)}%</td>
-          <td class="num">${eur(a.allocated_spend_eur)}</td>
-          <td>${a.exceeds_concentration_threshold
-            ? `<span class="pill bad">award breaches</span>`
-            : breachToday
-              ? `<span class="pill warn">reduces a standing breach</span>`
-              : `<span class="pill ok">within policy</span>`}</td>
-        </tr>`;
-      }).join("")}</tbody></table>
-      </div>
-      ${primary ? `<p class="small muted" style="margin-top:10px">
-        The remaining ${esc(primary.allocation_pct)}% (EUR ${eur(primary.allocated_spend_eur)})
-        goes to the primary award, ${esc(names[primary.supplier_id] || primary.supplier_id)},
-        shown in the supplier summary above.</p>` : ""}
-      ${vendors.filter((v) => !v.is_quoting).length ? `<p class="small muted" style="margin-top:10px">
-        Incumbent vendors not quoting:
-        ${vendors.filter((v) => !v.is_quoting).map((v) =>
-          `${esc(v.supplier_id)} (${esc(v.share_pct)}%)`).join(", ")}.</p>` : ""}
-      <p class="small muted" style="margin-top:10px">Share today is measured from the
-      PO history. The category strategy does not state a split between primary and
-      secondary source, so the proposed share is a configured assumption — shown
-      beside what each supplier holds now so the award reads as a shift.</p>
-    </div>`;
-}
-
-function commercialTermsPanel(r) {
-  const rows = r.suppliers.map((s) => {
-    const moq = (s.moq_terms || []).map((m) => esc(m.text || `${m.qty || ""} ${m.uom || ""}`.trim()));
-    const unique = [...new Set(moq)];
-    const discounts = (s.discount_structure || []).length
-      ? s.discount_structure.map((d) => {
-          const condition = (d.condition_text || "").replace(/^\s*\d+(\.\d+)?\s*%\s*/, "");
-          return `${esc(d.discount_pct)}% <span class="muted">${esc(condition)}</span>`;
-        }).join("<br>")
-      : `<span class="muted">none quoted</span>`;
-    return `<tr>
-      <td><strong>${esc(s.supplier_name)}</strong></td>
-      <td>${esc(s.incoterm || "-")}</td>
-      <td>${s.payment_terms_net_days ? "Net " + s.payment_terms_net_days : "-"}</td>
-      <td>${s.lead_time_min_weeks ?? "-"}-${s.lead_time_max_weeks ?? "-"} wks
-        <div class="derived">midpoint ${esc(s.lead_time_midpoint_weeks ?? "-")}</div></td>
-      <td>${esc(s.quote_date || "-")}</td>
-      <td>${esc(s.valid_until || "-")}${validityNote(s)}</td>
-      <td class="small">${unique.length ? unique.join("<br>") : "<span class='muted'>not stated</span>"}</td>
-      <td class="small">${discounts}</td>
-    </tr>`;
-  }).join("");
-
-  return `
-    <h2>Commercial terms</h2>
-    <div class="card scroll">
-      <table><thead><tr><th>Supplier</th><th>Incoterm</th><th>Payment terms</th>
-        <th>Lead time</th><th>Quote date</th><th>Valid until</th>
-        <th>MOQ terms</th><th>Discount structure</th></tr></thead>
-      <tbody>${rows}</tbody></table>
-      <p class="small muted" style="margin-top:10px">Payment terms and lead time also feed
-      the promotion rule. MOQ terms feed Gate 2.</p>
-    </div>`;
-}
-
-function compliancePanel(r) {
-  const matrix = (r.compliance_matrix || []).filter((row) => !HIDDEN_COMPLIANCE.has(row.code));
-  if (!matrix.length) return "";
+function materialTable(r) {
   const suppliers = r.suppliers.map((s) => s.supplier_id);
   const names = Object.fromEntries(r.suppliers.map((s) => [s.supplier_id, s.supplier_name]));
-
-  const mark = (claim) => claim && claim.claimed
-    ? `<span class="pill ok" title="${esc(claim.evidence_text || "")}${claim.evidence_page ? ` (p.${claim.evidence_page})` : ""}">met</span>`
-    : `<span class="pill warn">gap</span>`;
-
+  const materials = [...new Map(r.lines.map((l) => [l.cas_no, l])).values()];
   return `
-    <h2>Quality and compliance checklist</h2>
-    <div class="card scroll">
-      <table><thead><tr><th>Requirement</th><th>Tier</th>
-        ${suppliers.map((s) => `<th>${esc(names[s])}</th>`).join("")}</tr></thead>
-      <tbody>${matrix.map((row) => `<tr>
-        <td>${esc(row.label)}<div class="derived">${esc(row.code)}</div></td>
-        <td><span class="pill ${row.tier === "MANDATORY" ? "bad" : "info"}">${esc(row.tier.toLowerCase())}</span></td>
-        ${suppliers.map((s) => `<td>${mark(row.suppliers[s])}</td>`).join("")}
-      </tr>`).join("")}</tbody></table>
-      <p class="small muted" style="margin-top:10px">Mandatory gaps exclude a supplier at Gate 1.
-      Advisory gaps feed the compliance condition of the promotion rule. A requirement the quote
-      does not mention is a gap, never an assumed pass — hover a met badge for the quoted evidence.</p>
+    <h2>Price comparison by material</h2>
+    <div class="card">
+      <div class="scroll"><table><thead><tr>
+        <th>Material</th><th class="num">Ceiling (EUR/L)</th>
+        ${suppliers.map((id) => `<th class="num">${esc(names[id])}</th>`).join("")}
+      </tr></thead><tbody>
+      ${materials.map((m) => `<tr>
+        <td>${esc(m.material_name)}<div class="derived">CAS ${esc(m.cas_no)}</div></td>
+        <td class="num">${num(m.ceiling_price_eur_l, 2)}</td>
+        ${suppliers.map((id) => {
+          const line = r.lines.find((l) => l.cas_no === m.cas_no && l.supplier_id === id);
+          if (!line) return `<td class="num muted">not quoted</td>`;
+          return `<td class="num ${line.above_ceiling ? "above" : ""} ${line.is_cheapest_for_material ? "best" : ""}">
+            ${num(line.landed_price_per_l_eur, 2)}
+            ${line.above_ceiling ? `<div class="derived above">above ceiling</div>` : ""}</td>`;
+        }).join("")}
+      </tr>`).join("")}
+      <tr class="total-row"><td>Items above ceiling</td><td class="num">—</td>
+        ${r.suppliers.map((s) => `<td class="num">${aboveCount(r, s)} of ${quotedCount(r, s)}</td>`).join("")}
+      </tr>
+      </tbody></table></div>
+      <p class="small muted" style="margin-top:10px">Landed price is the quoted price converted to
+      EUR per litre and adjusted by the Incoterm's fixed freight percentage.</p>
     </div>`;
 }
 
-function dataQualityPanel(r) {
-  const issues = r.data_quality || [];
-  if (!issues.length) return "";
+function costBreakdown(r) {
   return `
-    <h2>Data quality</h2>
-    <div class="card scroll">
-      <table><thead><tr><th>Supplier</th><th>Material</th><th>Issue</th>
-        <th class="num">Stated (EUR)</th><th class="num">Recomputed (EUR)</th><th class="num">Difference (EUR)</th></tr></thead>
-      <tbody>${issues.map((d) => `<tr>
-        <td>${esc(d.supplier_name)}</td><td>${esc(d.material_name)}</td>
-        <td><span class="pill warn">${esc((d.flag || "").toLowerCase().replace(/_/g, " "))}</span>
-          <div class="small muted">${esc(d.note || "")}</div></td>
-        <td class="num">${eur(d.line_total_stated)}</td>
-        <td class="num">${eur(d.line_total_recomputed)}</td>
-        <td class="num">${eur(d.line_total_delta)}</td>
-      </tr>`).join("")}</tbody></table>
-      <p class="small muted" style="margin-top:10px">Flagged, never corrected. The totals above
-      still use the quoted unit price.</p>
+    <h2>Cost breakdown</h2>
+    <div class="card"><div class="scroll">
+      <table><thead><tr><th>Supplier</th><th class="num">Goods subtotal (EUR)</th>
+        <th class="num">Discount</th><th>Freight</th>
+        <th class="num">Total landed (EUR)</th></tr></thead><tbody>
+      ${r.suppliers.map((s) => `<tr>
+        <td>${esc(s.supplier_name)}</td>
+        <td class="num">${eur(s.goods_subtotal_eur)}</td>
+        <td class="num">${s.discount_amount_eur !== "0.00"
+          ? "−" + esc(s.discount_pct_applied) + "%" : "none offered"}</td>
+        <td>${s.freight_policy_matched === false
+          ? `<span class="above">no policy for ${esc(s.incoterm || "missing Incoterm")}</span>`
+          : (Number(s.freight_adj_pct) === 0 ? "included (delivered price)"
+             : "+" + esc(s.freight_adj_pct) + "% (estimate)")}</td>
+        <td class="num"><strong>${eur(s.total_landed_cost_eur)}</strong></td>
+      </tr>`).join("")}
+      </tbody></table>
+    </div></div>`;
+}
+
+/* One table, four views. Each row is [label, valueFor(supplier)]. */
+function comparisonTabs(r) {
+  const gate1 = (s) => (r.gates[s.supplier_id] || [{}])[0];
+  const moq = (s) => [...new Set((s.moq_terms || [])
+    .map((m) => m.text || `${m.qty || ""} ${m.uom || ""}`.trim()).filter(Boolean))];
+  // Follows whatever checklist is in force rather than a hard-coded list, so a
+  // strategy upload that adds or renames a requirement shows up here too.
+  const visible = (codes) => (codes || []).filter((c) => !HIDDEN_COMPLIANCE.has(c));
+  const checklistRows = (r.compliance_matrix || [])
+    .filter((row) => !HIDDEN_COMPLIANCE.has(row.code))
+    .map((row) => [row.label || row.code,
+      (s) => (row.suppliers[s.supplier_id] || {}).claimed ? "Yes" : "Not stated"]);
+
+  const TABS = {
+    commercial: ["Commercial", [
+      ["Total landed cost", (s) => "EUR " + eur(s.total_landed_cost_eur)],
+      ["Payment terms", (s) => s.payment_terms_net_days ? "Net " + s.payment_terms_net_days : "—"],
+      ["Discount offered", (s) => (s.discount_structure || []).length
+        ? s.discount_structure.map((d) => `${esc(d.discount_pct)}% ${esc((d.condition_type || "").replace("_", " ").toLowerCase())}`).join("<br>")
+        : "None"],
+      ["Quote valid until", (s) => (s.valid_until || "—") + (s.is_expired ? " (expired)" : "")],
+      ["Currency", (s) => esc(s.currency || "—")],
+    ]],
+    compliance: ["Compliance", [
+      ["Mandatory items", (s) => gate1(s).passed ? "All stated"
+        : "Gaps: " + visible((gate1(s).detail || {}).gaps).join(", ")],
+      ...checklistRows,
+      ["Open advisory items", (s) => visible(s.advisory_gaps).length
+        ? String(visible(s.advisory_gaps).length) : "None"],
+    ]],
+    logistics: ["Logistics", [
+      ["Incoterm", (s) => esc(s.incoterm || "—")],
+      ["Lead time", (s) => `${s.lead_time_min_weeks ?? "—"}–${s.lead_time_max_weeks ?? "—"} weeks`],
+      ["MOQ", (s) => moq(s).length ? moq(s).join("<br>") : "not stated"],
+      ["Freight basis", (s) => esc(s.freight_basis || "—")],
+    ]],
+    risk: ["Risk", [
+      ["FX exposure", (s) => s.currency === "EUR" ? "None — quoted in EUR" : esc(s.currency || "—")],
+      ["Landed-cost certainty", (s) => s.freight_policy_matched === false ? "Unknown — no freight policy"
+        : Number(s.freight_adj_pct) === 0 ? "High — delivered price" : "Medium — freight estimated"],
+      // Compared against the other awarded suppliers rather than a fixed
+      // number of weeks. An invented cut-off would be a policy decision made
+      // in the front end, and the label would be wrong anyway - a supplier
+      // over the line is not necessarily the longest.
+      ["Sole-source risk", (s) => {
+        if (!isAwarded(s)) return "Not applicable — not recommended";
+        const mids = r.suppliers.filter(isAwarded)
+          .map((x) => Number(x.lead_time_midpoint_weeks))
+          .filter((n) => !Number.isNaN(n));
+        if (mids.length < 2) return "Single awarded supplier";
+        const mine = Number(s.lead_time_midpoint_weeks);
+        return mine === Math.max(...mids)
+          ? "Higher — longest lead time of the awarded suppliers" : "Low";
+      }],
+      ["Already supplying", (s) => s.is_incumbent
+        ? `Yes — ${esc(s.historical_share_pct)}% of past spend` : "No prior spend"],
+    ]],
+  };
+
+  const body = (rows) => `
+    <table><thead><tr><th></th>
+      ${r.suppliers.map((s) => `<th>${esc(s.supplier_name)}</th>`).join("")}
+    </tr></thead><tbody>
+    ${rows.map(([label, fn]) => `<tr><td class="row-label">${label}</td>
+      ${r.suppliers.map((s) => `<td>${fn(s)}</td>`).join("")}</tr>`).join("")}
+    </tbody></table>`;
+
+  return `
+    <h2>Comparison details</h2>
+    <div class="card">
+      <div class="tabs" id="cmp-tabs">
+        ${Object.entries(TABS).map(([key, [label]], i) =>
+          `<button class="tab ${i === 0 ? "on" : ""}" data-tab="${key}">${label}</button>`).join("")}
+      </div>
+      ${Object.entries(TABS).map(([key, [, rows]], i) =>
+        `<div class="tab-body scroll" data-panel="${key}" ${i ? "hidden" : ""}>${body(rows)}</div>`).join("")}
     </div>`;
+}
+
+function alignmentAndNegotiation(r) {
+  const awarded = new Set(r.suppliers.filter(isAwarded).map((s) => s.supplier_id));
+  const rows = (r.renegotiation || []).filter((c) => awarded.has(c.supplier_id));
+  return `
+    <div class="two-col">
+      <div>
+        <h2>Category strategy alignment</h2>
+        <div class="card" id="alignment-list">
+          <p class="muted small">No alignment notes available for this run.</p>
+        </div>
+      </div>
+      <div>
+        <h2>Negotiation opportunities</h2>
+        <div class="card">
+          ${rows.length ? `<div class="scroll"><table><thead><tr>
+            <th>Item</th><th>Supplier</th><th class="num">Gap</th></tr></thead><tbody>
+            ${rows.map((c) => `<tr>
+              <td>${esc(c.material_name)}
+                ${noteSlot("nego:" + c.cas_no, "tight")}</td>
+              <td>${esc(c.supplier_name)}</td>
+              <td class="num above">${esc(c.gap_pct)}%
+                <div class="derived">EUR ${eur(c.annual_impact_eur)}/yr</div></td>
+            </tr>`).join("")}
+            </tbody></table></div>`
+            : `<p class="muted small">No line item from an awarded supplier is priced
+               above its ceiling. Nothing to reprice before award.</p>`}
+        </div>
+      </div>
+    </div>`;
+}
+
+function footerNotes(r) {
+  return `
+    <div class="foot-grid">
+      <div><span class="foot-label">What this covers</span>${noteSlot("footer.covers")}</div>
+      <div><span class="foot-label">How prices were made comparable</span>${noteSlot("footer.comparable")}</div>
+      <div><span class="foot-label">What to double check</span>${noteSlot("footer.double_check")}</div>
+    </div>`;
+}
+
+/* --- the view -------------------------------------------------------------- */
+
+async function run(runId) {
+  const data = await api(`/runs/${runId}`);
+  const r = data.result;
+  const k = r.kpis;
+
+  view.innerHTML = `
+    <div class="dash-bar">
+      <div>
+        <h1>Quote comparison</h1>
+        <p class="muted small">${k.supplier_count} suppliers · ${k.material_count} materials ·
+        engine ${esc(r.engine_version)} · ${esc((r.generated_at || "").slice(0, 16).replace("T", " "))}</p>
+      </div>
+      <div class="row">
+        <a href="#/comparison/${esc(data.comparison_id)}" class="btn">Back to batch</a>
+        <button class="primary" id="package-btn">Approval package</button>
+      </div>
+    </div>
+
+    ${(k.unapproved_suppliers || []).length ? `<div class="banner bad">
+      Not on the approved supplier list: ${esc(k.unapproved_suppliers.join(", "))}.</div>` : ""}
+    ${(r.warnings || []).length ? `<div class="banner warn">
+      ${r.warnings.map(esc).join("<br>")}</div>` : ""}
+
+    ${kpiRow(r)}
+    ${rankingCards(r)}
+    ${methodology(r)}
+    ${materialTable(r)}
+    ${costBreakdown(r)}
+    ${comparisonTabs(r)}
+    ${promotionPanel(r)}
+    ${alignmentAndNegotiation(r)}
+    ${r.data_quality.length ? `<h2>Data quality</h2><div class="card"><div class="scroll">
+      <table><thead><tr><th>Supplier</th><th>Material</th><th>Issue</th>
+        <th class="num">Stated (EUR)</th><th class="num">Recomputed (EUR)</th></tr></thead><tbody>
+      ${r.data_quality.map((d) => `<tr><td>${esc(d.supplier_name)}</td>
+        <td>${esc(d.material_name)}</td><td class="small">${esc(d.note || d.flag)}</td>
+        <td class="num">${eur(d.line_total_stated)}</td>
+        <td class="num">${eur(d.line_total_recomputed)}</td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}
+
+    <h2>Ask about this recommendation</h2>
+    <div class="card chat">
+      <p class="chat-intro">The agent answers from this run only. It reads the stored
+      figures and the gate trail — it cannot recalculate or consider other quotes.</p>
+      <div class="chips" id="suggested"></div>
+      <div class="ask-row">
+        <input type="text" id="question" autocomplete="off"
+          placeholder="Ask anything about this comparison…">
+        <button class="primary" id="ask-btn">Ask</button>
+      </div>
+      <div id="answer"></div>
+    </div>
+
+    ${footerNotes(r)}`;
+
+  wireAgent(runId, r);
+  document.getElementById("package-btn").onclick = () => {
+    location.hash = `#/run/${runId}/package`;
+  };
+  const tabs = document.getElementById("cmp-tabs");
+  if (tabs) {
+    tabs.onclick = (e) => {
+      const btn = e.target.closest("[data-tab]");
+      if (!btn) return;
+      tabs.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t === btn));
+      document.querySelectorAll("[data-panel]").forEach((p) => {
+        p.hidden = p.dataset.panel !== btn.dataset.tab;
+      });
+    };
+  }
+
+  fillNotes(runId);          // prose arrives after the numbers; never blocks
 }
 
 function wireAgent(runId, r) {
@@ -772,33 +835,52 @@ function wireAgent(runId, r) {
   suggestions.push("What compliance gaps exist across the suppliers?");
 
   document.getElementById("suggested").innerHTML =
-    suggestions.map((q) => `<button class="link" data-q="${esc(q)}">${esc(q)}</button>`).join("");
+    suggestions.map((q) => `<button class="chip" data-q="${esc(q)}">${esc(q)}</button>`).join("");
 
   const $ = (id) => document.getElementById(id);
+  let busy = false;
 
   async function ask(question) {
-    if (!question.trim()) return;
-    if ($("answer")) $("answer").innerHTML = `<p class="muted small">Thinking…</p>`;
+    if (busy || !question.trim()) return;
+    busy = true;
+    $("ask-btn").disabled = true;
+    $("question").value = question;
+
+    // The question is echoed above the answer so a long reply still says what
+    // it is replying to, and the wait has something to sit under.
+    $("answer").innerHTML = `
+      <div class="qa">
+        <p class="qa-q">${esc(question)}</p>
+        <p class="qa-thinking">Reading the stored run<span class="dots"></span></p>
+      </div>`;
+
     try {
       const response = await api(`/runs/${runId}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question }),
       });
-      if ($("answer")) {
-        $("answer").innerHTML = `<div class="answer">${markdown(response.answer)}</div>`;
-      }
+      $("answer").innerHTML = `
+        <div class="qa">
+          <p class="qa-q">${esc(question)}</p>
+          <div class="answer">${markdown(response.answer)}</div>
+        </div>`;
     } catch (err) {
-      if ($("answer")) {
-        $("answer").innerHTML = `<div class="banner bad">${esc(err.message)}</div>`;
-      }
+      $("answer").innerHTML = `
+        <div class="qa">
+          <p class="qa-q">${esc(question)}</p>
+          <div class="banner bad">${esc(err.message)}</div>
+        </div>`;
+    } finally {
+      busy = false;
+      $("ask-btn").disabled = false;
     }
   }
 
   $("ask-btn").onclick = () => ask($("question").value);
   $("question").onkeydown = (e) => { if (e.key === "Enter") ask(e.target.value); };
   document.querySelectorAll("[data-q]").forEach((b) => {
-    b.onclick = () => { $("question").value = b.dataset.q; ask(b.dataset.q); };
+    b.onclick = () => ask(b.dataset.q);
   });
 }
 

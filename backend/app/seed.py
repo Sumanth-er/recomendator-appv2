@@ -18,6 +18,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .config import settings
 from .models import (
     Benchmark, CategoryStrategy, ComplianceRequirement, Demand, FreightPolicy,
     Material, PolicyConfig,
@@ -52,7 +53,7 @@ DEMAND = [
 ]
 
 FREIGHT = [
-    ("DAP", 0.0, "Delivered to Dresden - freight already included in the price", False),
+    ("DAP", 0.0, "Delivered to site - freight already included in the price", False),
     ("FOB", 5.0, "Estimated from the quote's own freight figure", True),
     ("EXW", 9.5, "Midpoint of the quote's stated 9-10% freight estimate", True),
 ]
@@ -116,7 +117,8 @@ def seed_reference_data(session: Session) -> None:
 
     for cas, qty in DEMAND:
         if not session.get(Demand, cas):
-            session.add(Demand(cas_no=cas, required_qty_l=qty))
+            session.add(Demand(cas_no=cas, required_qty_l=qty,
+                               plant=settings.plant_name))
             added += 1
 
     for incoterm, pct, note, est in FREIGHT:

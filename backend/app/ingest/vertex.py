@@ -54,6 +54,16 @@ def generate_json(contents, schema: dict) -> dict:
         temperature=0,
         response_mime_type="application/json",
         response_schema=schema,
+        # These calls pass no tools - they extract a fixed schema out of a
+        # document - so automatic function calling has nothing to do here. The
+        # SDK enables it by default anyway and logs a recommendation to use
+        # Chat.send_message instead, once per process. Saying no explicitly
+        # states the intent and keeps the log clean.
+        #
+        # disable on its own: setting maximum_remote_calls alongside it makes
+        # the SDK warn about the combination instead.
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            disable=True),
     )
 
     with telemetry.tracer().start_as_current_span("vertex.generate_json") as span:

@@ -463,6 +463,30 @@ def get_package(run_id: str, session: Session = Depends(get_session)):
     }
 
 
+@router.get("/runs/{run_id}/notes")
+def get_run_notes(run_id: str, refresh: bool = False,
+                  session: Session = Depends(get_session)):
+    """Short written notes for the dashboard, drafted once per run.
+
+    Never fails the page. A model that is unreachable, slow or that returns
+    something unexpected comes back as available=false with empty notes, and
+    the dashboard renders every number exactly as it would otherwise - the
+    prose slots are simply blank.
+    """
+    if not session.get(EvaluationRun, run_id):
+        raise HTTPException(404, "run not found")
+
+    from ..notes import EMPTY, SCHEMA_VERSION, get_or_create
+
+    try:
+        return get_or_create(session, run_id, refresh=refresh)
+    except Exception as exc:  # noqa: BLE001 - notes are decoration, not data
+        log.warning("dashboard notes failed for run %s: %s", run_id, exc)
+        session.rollback()
+        return {"available": False, "notes": EMPTY,
+                "schema_version": SCHEMA_VERSION}
+
+
 @router.get("/runs/{run_id}/package.docx")
 def download_package(run_id: str, session: Session = Depends(get_session)):
     """The approval package as a Word document.

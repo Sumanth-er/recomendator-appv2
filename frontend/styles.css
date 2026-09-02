@@ -28,14 +28,14 @@ body {
 .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
 
 .topbar {
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
+  background: var(--accent-soft);
+  border-bottom: 1px solid #cfe2f5;
   margin-bottom: 28px;
 }
 .topbar .wrap { display: flex; align-items: center; gap: 14px; height: 60px; }
 .brand { font-weight: 600; color: var(--text); text-decoration: none; font-size: 16px; }
 .topbar nav { margin-left: auto; display: flex; gap: 18px; }
-.topbar nav a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.topbar nav a { color: #3f6791; text-decoration: none; font-size: 14px; }
 .topbar nav a:hover { color: var(--accent); }
 
 h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
@@ -88,8 +88,19 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 tbody tr:last-child td { border-bottom: none; }
 .scroll { overflow-x: auto; }
 
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 8px; }
-.kpi { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+.kpis {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 1px; background: var(--line);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  overflow: hidden; margin-bottom: 24px;
+}
+/* The recommended supplier carries a name and two sentences where the others
+   carry a figure and one, so it gets the extra width - but only when all four
+   fit on a row. Once they wrap, equal columns read better. */
+@media (min-width: 940px) {
+  .kpis { grid-template-columns: 1.35fr 1fr 1fr 1fr; }
+}
+.kpi { background: var(--surface); padding: 16px 18px; }
 .kpi .label { font-size: 11.5px; color: var(--muted); margin-bottom: 3px; }
 /* Sized to fit a supplier name and a six-figure amount on one line without
    wrapping, which 21px did not. */
@@ -176,3 +187,154 @@ tbody tr:last-child td { border-bottom: none; }
 .banner.ok { background: var(--ok-soft); color: var(--ok); }
 .banner.warn { background: var(--warn-soft); color: var(--warn); }
 .banner.bad { background: var(--bad-soft); color: var(--bad); }
+
+
+/* ------------------------------------------------------------- dashboard */
+
+.dash-bar {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 16px; flex-wrap: wrap; margin-bottom: 18px;
+}
+.dash-bar h1 { margin: 0 0 2px; }
+
+/* A caption written by the model. Empty until it arrives, and empty for good
+   if it never does - so it must take no space when it has no text. */
+.note-slot { margin: 6px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+.note-slot:empty { display: none; }
+
+/* A dotted rule marks where the engine's figures stop and the written note
+   begins, so a reader can tell at a glance which half was calculated and which
+   was drafted. Only the first note in a card carries it - consecutive notes
+   are one passage, not two. */
+.kpi .note-slot, .rank-card .note-slot {
+  border-top: 1px dotted var(--line-strong);
+  padding-top: 9px; margin-top: 9px;
+}
+.kpi .note-slot + .note-slot, .rank-card .note-slot + .note-slot {
+  border-top: none; padding-top: 0; margin-top: 6px;
+}
+.kpi.feature .note-slot { border-top-color: #3f6791; }
+.note-slot.lead { color: var(--text); font-size: 13px; }
+.note-slot.tight { margin-top: 3px; font-size: 11.5px; }
+
+.kpi .sub { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+.kpi.feature { background: #123a63; color: #eef4fa; }
+.kpi.feature .value { font-size: 17px; color: #fff; }
+.kpi.feature .label { color: #a9c6e2; }
+.kpi.feature .sub, .kpi.feature .note-slot { color: #c7d9ea; }
+.kpi.feature .note-slot.lead { color: #f2f7fb; }
+
+.rank-grid, .steps-grid {
+  display: grid; gap: 12px; margin-bottom: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.rank-card, .step {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px 16px;
+}
+.rank-card.is-primary { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.rank-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.rank-no {
+  font-size: 11px; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--muted);
+}
+.rank-card h3 { margin: 8px 0 2px; font-size: 15px; }
+.rank-meta { font-size: 11.5px; color: var(--muted); }
+.rank-total {
+  margin-top: 10px; font-size: 19px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.rank-sub { font-size: 11.5px; color: var(--muted); }
+
+.step-no {
+  font-size: 10.5px; font-weight: 600; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--accent);
+}
+.step h3 { margin: 4px 0 6px; font-size: 14px; }
+/* A step's pill can name several suppliers, so it wraps where the status
+   pills elsewhere stay on one line. */
+.step .pill { margin-top: 8px; white-space: normal; line-height: 1.5; }
+
+/* One table, four views. */
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+button.tab {
+  border-radius: 999px; padding: 5px 14px; font-size: 13px;
+  background: var(--surface); border: 1px solid var(--line); color: var(--muted);
+}
+button.tab.on {
+  background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 500;
+}
+.tab-body table { font-size: 13.5px; }
+.tab-body td.row-label, td.row-label { color: var(--muted); width: 210px; }
+.tab-body th:first-child { width: 210px; }
+
+.two-col {
+  display: grid; gap: 20px; align-items: start;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+}
+.two-col h2 { margin-top: 0; }
+
+.align-item { display: flex; gap: 10px; align-items: flex-start; padding: 9px 0; }
+.align-item + .align-item { border-top: 1px solid var(--line); }
+.align-item p { margin: 2px 0 0; }
+.align-tick {
+  flex: none; width: 18px; height: 18px; border-radius: 50%;
+  display: grid; place-items: center; margin-top: 1px;
+  background: var(--ok-soft); color: var(--ok); font-size: 11px; font-weight: 700;
+}
+
+.foot-grid {
+  display: grid; gap: 18px; margin-top: 34px; padding-top: 18px;
+  border-top: 1px solid var(--line);
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+.foot-label {
+  display: block; font-size: 11px; font-weight: 600; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--muted);
+}
+
+td.best { background: var(--ok-soft); }
+tr.total-row td { font-weight: 600; border-top: 1px solid var(--line-strong); }
+
+
+/* ------------------------------------------------------------ agent chat */
+
+.chat { display: flex; flex-direction: column; gap: 12px; }
+.chat-intro { margin: 0; font-size: 12.5px; color: var(--muted); max-width: 70ch; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 7px; }
+button.chip {
+  border-radius: 999px; padding: 5px 12px; font-size: 12.5px; text-align: left;
+  background: var(--surface); border: 1px solid var(--line); color: var(--muted);
+}
+button.chip:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+
+.ask-row { display: flex; gap: 8px; }
+.ask-row input {
+  flex: 1; min-width: 0; padding: 9px 12px; font-size: 14px;
+  border: 1px solid var(--line-strong); border-radius: var(--radius);
+  background: var(--surface); color: var(--text);
+}
+.ask-row input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.qa { border-top: 1px solid var(--line); padding-top: 12px; }
+.qa-q {
+  margin: 0 0 8px; font-weight: 600; font-size: 14px;
+  padding-left: 10px; border-left: 3px solid var(--accent);
+}
+.qa-thinking { margin: 0; color: var(--muted); font-size: 13.5px; }
+/* Three dots that fill in, so a slow answer still looks like it is working. */
+.dots::after {
+  content: ""; animation: dots 1.2s steps(4, end) infinite;
+}
+@keyframes dots { 0% { content: ""; } 25% { content: "."; }
+                  50% { content: ".."; } 75% { content: "..."; } }
+@media (prefers-reduced-motion: reduce) {
+  .dots::after { content: "…"; animation: none; }
+}
+.answer { font-size: 14.5px; line-height: 1.6; }
+.answer table { margin: 8px 0; }
+.answer h2, .answer h3 { font-size: 15px; margin: 14px 0 6px; }

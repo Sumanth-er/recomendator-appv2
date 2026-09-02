@@ -72,7 +72,7 @@ class Demand(Base):
     __tablename__ = "demand"
     cas_no: Mapped[str] = mapped_column(
         String(32), ForeignKey("material.cas_no"), primary_key=True)
-    plant: Mapped[str] = mapped_column(String(100), default="Infineon Dresden")
+    plant: Mapped[str] = mapped_column(String(100), default="")
     required_qty_l: Mapped[float] = mapped_column(Numeric(16, 4))
 
 
@@ -335,6 +335,27 @@ class EvaluationRun(Base):
     policy_snapshot: Mapped[dict] = mapped_column(JSON)
     engine_version: Mapped[str] = mapped_column(String(32))
     result: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class RunNotes(Base):
+    """Short written notes for one run's dashboard, drafted by the model.
+
+    Every number on the dashboard comes from the run itself; this table holds
+    only the sentences around them. Generated once per run and reused, because
+    a run is immutable - the same figures would produce the same note.
+
+    `schema_version` is what lets a newer dashboard sit on top of notes written
+    by an older one: the reader takes the keys it knows and leaves the rest
+    blank rather than failing. Nothing here is required for the dashboard to
+    work; with this table empty every prose slot simply renders empty.
+    """
+    __tablename__ = "run_notes"
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("evaluation_run.run_id"), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    notes: Mapped[dict] = mapped_column(JSON, default=dict)
+    model: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

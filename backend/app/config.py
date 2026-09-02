@@ -29,6 +29,11 @@ class Settings:
     db_name: str = os.getenv("DB_NAME", "quotepoc")
     database_url: str = os.getenv("DATABASE_URL", "")
 
+    # --- Site identity ---
+    # Printed on the approval package. Unset by default so no customer site
+    # is baked into the image; set PLANT_NAME per deployment.
+    plant_name: str = os.getenv("PLANT_NAME", "")
+
     engine_version: str = "1.0.0"
 
     def sqlalchemy_url(self):

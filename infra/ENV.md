@@ -43,7 +43,9 @@ for role in roles/cloudsql.client roles/storage.objectAdmin roles/documentai.api
 | `DB_NAME` | no | `quotepoc` | The database must already exist |
 | `VERTEX_LOCATION` | no | `global` | Gemini availability is region specific; `global` works everywhere |
 | `VERTEX_MODEL` | no | `gemini-2.5-flash` | |
+| `AGENT_TIMEOUT_SECONDS` | no | `120` | Budget for one agent call. Past it the deterministic answer is used. Keep it under the nginx (300s) and Cloud Run request timeouts |
 | `DATABASE_URL` | no | — | Full SQLAlchemy URL. If set it overrides every `DB_*` and `INSTANCE_CONNECTION_NAME` value above |
+| `PLANT_NAME` | no | — | Site named on the approval package. Unset, the destination clause is omitted |
 | `PORT` | no | `8080` | Cloud Run sets this itself — do not override |
 | `GOOGLE_GENAI_USE_VERTEXAI` | no | derived `TRUE` | See below — set only to override |
 | `GOOGLE_CLOUD_PROJECT` | no | derived from `GCP_PROJECT` | |
