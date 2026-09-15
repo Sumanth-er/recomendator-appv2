@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from opentelemetry import trace as otel_trace
 
-from . import telemetry
+from . import a2a, telemetry
 from .config import settings
 
 
@@ -100,6 +100,7 @@ async def lifespan(app: FastAPI):
         settings.bucket or "-", settings.docai_processor_id or "-",
         settings.vertex_model, settings.vertex_location, telemetry.status(),
     )
+    await a2a.install(app)
     try:
         yield
     finally:

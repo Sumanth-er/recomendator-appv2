@@ -1,9 +1,13 @@
 """The sourcing agent, built on ADK.
 
-It answers questions about a finished run and drafts the approval memo. Its
-instruction is deliberately restrictive: it may only state numbers that came
-back from a tool, and it must show the gate trail rather than assert a
-conclusion.
+One agent answers questions about a finished run, simulates what would change
+under different assumptions, and changes the policy the engine runs on when the
+buyer asks it to. The dashboard chat, the per-run ask endpoint and the A2A
+surface all use it. Its instruction is deliberately restrictive: it may only
+state numbers that came back from a tool, and it must show the gate trail
+rather than assert a conclusion.
+
+A second, read-only configuration drafts the approval memo.
 """
 from __future__ import annotations
 
@@ -13,11 +17,19 @@ import os
 
 from .. import telemetry
 from ..config import settings
-from .tools import ALL_TOOLS
+from .tools import AGENT_TOOLS, READ_TOOLS, TurnLog, record_turn
 
 log = logging.getLogger(__name__)
 
 APP_NAME = "sourcing-agent"
+AGENT_NAME = "sourcing_agent"
+
+DEFAULT_DESCRIPTION = (
+    "A procurement analyst for a buyer at a semiconductor plant: explains a "
+    "completed supplier quote evaluation, simulates what-if changes, and "
+    "changes rule thresholds, ceiling prices, required volumes and compliance "
+    "requirements when asked."
+)
 
 # How long the agent gets before the deterministic answer is used instead.
 #
@@ -28,13 +40,82 @@ APP_NAME = "sourcing-agent"
 # those limits turns that into a correct, if less fluent, reply.
 AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))
 
-INSTRUCTION = """You are a procurement analyst explaining a completed supplier
-quote evaluation to a buyer at a semiconductor plant.
+# No curly braces anywhere in this text: ADK reads a name in braces inside an
+# instruction as a session-state placeholder.
+INSTRUCTION = """You are the sourcing agent for a buyer at a semiconductor
+plant. A deterministic rule engine has evaluated supplier quotations for a
+basket of wet chemicals. You explain that evaluation, simulate what would
+change under different assumptions, and change the policy it runs on when the
+buyer tells you to.
 
-The evaluation has already been calculated by a rule engine. Your job is to
-explain it, never to redo it.
+Every request is one of three kinds. Decide which before calling any tool.
 
-Hard rules:
+1. Explain - a question about the evaluation as it stands: ranking, gates,
+   the promotion rule, compliance, prices, allocation, negotiation. Use the
+   read tools against the run id. Change nothing.
+2. What if - a hypothetical: "what if", "what would happen", "would X still
+   win", "suppose", "how sensitive is". Call simulate_what_if. Nothing is
+   saved.
+3. Change - the buyer tells you to change something: "set", "change", "make",
+   "lower", "raise", "remove", "add", "update", "apply that", "go ahead".
+   Call apply_changes, or add_compliance_requirement for a requirement that is
+   not on the checklist yet, or rerun_evaluation to re-evaluate with no
+   change. This saves the change and creates a new evaluation run.
+
+If you cannot tell whether the buyer wants a what-if or a real change, run the
+simulation, report it, and ask whether to apply it. Never apply a change the
+buyer did not ask for.
+
+What can be simulated or changed. simulate_what_if and apply_changes take the
+same arguments, lists of "KEY=VALUE" strings:
+- policy_changes: rule thresholds, keyed as in get_current_policy, for example
+  "ceiling_materiality_pct=10" (Gate 3), "moq_overbuy_threshold_pct=15"
+  (Gate 2), "promotion_band_pct=12" (promotion rule) or
+  "max_vendor_share_pct=70" (concentration check).
+- ceiling_price_changes: a material's ceiling price in EUR per litre, keyed by
+  CAS number from get_current_materials, for example "7664-93-9=0.90".
+- volume_changes: a material's required volume in litres, keyed by CAS number,
+  for example "7664-93-9=40000".
+- compliance_changes: an existing checklist code's tier, keyed by code from
+  get_current_compliance: "SDS_LANGUAGE=MANDATORY", "ISO_9001=ADVISORY" or
+  "TSCA=REMOVED".
+"Lower the ceiling for sulfuric acid" is a ceiling price; "tolerate more over
+ceiling" is ceiling_materiality_pct; "make SDS mandatory" is a compliance tier.
+If a request could mean more than one of these, ask which.
+
+Values: a bare number is the new value. For a relative request pass the change
+with a sign and let the tool resolve it: "ceiling_materiality_pct=+2" adds 2
+percentage points, "7664-93-9=-10%" lowers that ceiling by ten percent of its
+current value. For a percentage threshold, "by 2%" means 2 percentage points
+unless the buyer says otherwise. Never work out a new value yourself. Look up
+the current value first with get_current_policy, get_current_materials or
+get_current_compliance unless this conversation already has it.
+
+Reporting a what-if:
+- Say plainly that it is a simulation and nothing was saved.
+- State each change with its previous and new value, as the tool returned
+  them.
+- Say whether the recommendation changes and which suppliers' rank, award
+  status or failed gate move, from the tool's outcome. If nothing moves, say
+  so.
+- If policy_in_force_matches_this_run is false, say the policy has changed
+  since this run, so the comparison is against today's policy.
+- Finish by giving the exact change in KEY=VALUE form and offering to apply
+  it.
+
+Reporting a change:
+- Only say something was changed if the tool returned applied or added as
+  true. If it returned errors, nothing was saved: say so and give the reason.
+- State each change with its previous and new value, that a new evaluation run
+  was created, and what moved in the outcome.
+- Say that it applies to every future evaluation, and that runs already
+  created keep the policy they were evaluated with.
+- When the buyer says to apply a simulation, apply exactly the arguments that
+  simulation recorded in this conversation.
+- After a change, later questions are about the new run: use the new_run_id
+  the tool returned as the run id.
+
+Hard rules, always:
 - Never state a number that did not come back from a tool call. Do no
   arithmetic of your own, including percentages and differences.
 - Always name the rule a claim rests on: Gate 1 mandatory compliance, Gate 2
@@ -54,8 +135,8 @@ Hard rules:
 - Historical prices come from the buyer's own purchase history, and the share
   each vendor holds today is measured from it. The proposed award split is a
   configured assumption - say so when you use it.
-- If a question asks what would happen under different assumptions, say that it
-  needs a fresh evaluation. Do not simulate it.
+- Every run-scoped tool needs the evaluation run id. It comes with the request;
+  if it does not, ask for it. Never invent one.
 - If the run does not contain the answer, say so plainly.
 
 Write in plain prose for a buyer. Be concise and specific.
@@ -121,20 +202,25 @@ Currency is EUR throughout and every amount says so. Do not invent a figure, an
 RFQ number or a person's name; leave a field blank rather than filling it.
 """
 
+# Tools that change policy or create a run. A reply about one of these has to
+# be accurate even when the model never got to write it - see _unfinished_reply.
+CHANGING_TOOLS = {"apply_changes", "add_compliance_requirement", "rerun_evaluation"}
 
-def build_agent(instruction: str = INSTRUCTION):
+
+def build_agent(instruction: str = INSTRUCTION, description: str = "", tools=None):
     from google.adk.agents import Agent
 
     return Agent(
-        name="sourcing_agent",
+        name=AGENT_NAME,
         model=settings.vertex_model,
         instruction=instruction,
-        tools=ALL_TOOLS,
+        description=description or DEFAULT_DESCRIPTION,
+        tools=list(tools if tools is not None else AGENT_TOOLS),
     )
 
 
-async def _ask(instruction: str, prompt: str, operation: str, run_id: str) -> str:
-    """Run the agent once and collect its text.
+async def _ask(instruction: str, prompt: str, operation: str, run_id: str, tools=None) -> str:
+    """Run the agent once and collect its reply.
 
     The span opened here is the parent the ADK spans hang off. ADK instruments
     itself through the global tracer provider, so once telemetry.setup() has
@@ -150,7 +236,7 @@ async def _ask(instruction: str, prompt: str, operation: str, run_id: str) -> st
             span,
             **{
                 "gen_ai.operation.name": operation,
-                "gen_ai.agent.name": "sourcing_agent",
+                "gen_ai.agent.name": AGENT_NAME,
                 "gen_ai.request.model": settings.vertex_model,
                 "run.id": run_id,
             },
@@ -163,24 +249,32 @@ async def _ask(instruction: str, prompt: str, operation: str, run_id: str) -> st
         # alive after the answer has been sent, which on a warm Cloud Run
         # instance accumulates until the container is killed mid-request and the
         # browser sees a dropped connection rather than an error.
-        async with InMemoryRunner(agent=build_agent(instruction),
+        async with InMemoryRunner(agent=build_agent(instruction=instruction, tools=tools),
                                   app_name=APP_NAME) as runner:
             session = await runner.session_service.create_session(
                 app_name=APP_NAME, user_id="buyer")
 
-            chunks: list[str] = []
+            final: list[str] = []
+            interim: list[str] = []
             async for event in runner.run_async(
                 user_id="buyer",
                 session_id=session.id,
                 new_message=types.Content(
                     role="user", parts=[types.Part(text=prompt)]),
             ):
-                if event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if getattr(part, "text", None):
-                            chunks.append(part.text)
+                if not (event.content and event.content.parts):
+                    continue
+                text = "".join(
+                    part.text for part in event.content.parts
+                    if getattr(part, "text", None) and not getattr(part, "thought", False)
+                ).strip()
+                if text:
+                    # Text written alongside a tool call ("let me check the
+                    # gates") is not the answer; the final response is. It is
+                    # kept only in case the model ends without one.
+                    (final if event.is_final_response() else interim).append(text)
 
-            answer = "".join(chunks).strip()
+            answer = "\n\n".join(final or interim).strip()
 
         telemetry.set_attributes(span, **{"gen_ai.response.length": len(answer)})
         return answer
@@ -208,26 +302,119 @@ def _agent_timed_out(operation: str) -> None:
                 "run instead", operation, AGENT_TIMEOUT_SECONDS)
 
 
-async def explain(run_id: str, question: str) -> str:
+def _transcript(history: list[dict] | None) -> str:
+    """Earlier turns, replayed into the prompt.
+
+    An agent turn that simulated or changed something carries its exact tool
+    arguments, so "apply that" applies what was simulated rather than what the
+    prose happened to say about it.
+    """
+    if not history:
+        return ""
+    turns = []
+    for turn in history[-10:]:  # enough context without an unbounded prompt
+        if turn["role"] == "user":
+            turns.append(f"Buyer: {turn['content']}")
+            continue
+        turns.append(f"You: {turn['content']}")
+        for action in turn.get("actions") or []:
+            arguments = {k: v for k, v in (action.get("arguments") or {}).items() if v}
+            created = f", which created run {action['new_run_id']}" if action.get("new_run_id") else ""
+            turns.append(f"  (you called {action.get('tool')} with {arguments}{created})")
+    return "Earlier in this conversation:\n" + "\n".join(turns) + "\n\n"
+
+
+def _describe_action(action: dict) -> list[str]:
+    tool = action.get("tool")
+    if tool == "apply_changes":
+        lines = []
+        for change in action.get("changes") or []:
+            subject = change["key"] + (f" ({change['material']})" if change.get("material") else "")
+            unit = f" {change['unit']}" if change.get("unit") else ""
+            lines.append(f"- Changed {change['kind']} {subject}: "
+                         f"{change.get('previous')} to {change['new']}{unit}")
+        return lines + [f"- Created evaluation run {action['new_run_id']}"]
+    if tool == "add_compliance_requirement":
+        added = action.get("arguments") or {}
+        return [f"- Added compliance requirement {added.get('code')} "
+                f"({added.get('label')}) as {added.get('tier')}"]
+    if tool == "rerun_evaluation":
+        return [f"- Re-evaluated the basket into run {action['new_run_id']}"]
+    return []
+
+
+def _unfinished_reply(run_id: str, turn: TurnLog) -> str:
+    """The reply when the model could not write one.
+
+    If a change was saved before the agent stalled, that has to be said -
+    "nothing happened" would be wrong, and the buyer would ask for it again.
+    Otherwise the stored run answers, and says nothing was changed.
+    """
+    done = [line for action in turn.actions if action.get("tool") in CHANGING_TOOLS
+            for line in _describe_action(action)]
+    if done:
+        latest = turn.new_run_ids[-1] if turn.new_run_ids else run_id
+        return "\n".join(
+            ["The agent could not finish its reply, but these changes were saved:", ""]
+            + done + ["", fallback_explanation(latest)])
+    return ("The agent could not answer just now, and nothing was changed. "
+            "Here is the stored evaluation instead.\n\n" + fallback_explanation(run_id))
+
+
+async def chat(run_id: str, question: str, history: list[dict] | None = None,
+               operation: str = "chat") -> dict:
+    """Answer one request - explain, simulate or change; the agent decides.
+
+    Returns the reply with what the turn did: new_run_id when the basket was
+    re-evaluated into a new run, last_simulation (the arguments that would
+    apply it) when the turn ended on an unsaved what-if, and the actions
+    themselves for the transcript.
+
+    Continuity is a transcript replayed into the prompt, not a persistent ADK
+    session - _ask() still builds and tears down a fresh InMemoryRunner every
+    call (see its docstring for why: a warm Cloud Run instance would
+    otherwise accumulate open sessions across requests). The actual memory of
+    the conversation lives in chat_message rows, passed in here as history,
+    which is what makes it survive a request landing on a different Cloud Run
+    instance than the one before it.
+    """
     prompt = (
-        f"The evaluation run id is {run_id}. Use your tools against that run id "
-        f"to answer this question from the buyer:\n\n{question}"
+        f"The evaluation run id is {run_id}. Use it for every run-scoped tool, "
+        f"unless a change in this turn creates a newer run.\n\n"
+        f"{_transcript(history)}New request from the buyer:\n\n{question}"
     )
-    try:
-        return await asyncio.wait_for(
-            _ask(INSTRUCTION, prompt, "explain", run_id),
-            timeout=AGENT_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        _agent_timed_out("explain")
-        return fallback_explanation(run_id)
-    except Exception as exc:  # noqa: BLE001 - fall back rather than fail the request
-        _agent_failed("explain", exc)
-        return fallback_explanation(run_id)
-    finally:
-        # The agent's spans are the point of this exercise and Cloud Run can
-        # take the CPU away as soon as the response is written, so they go out
-        # now rather than on the batch processor's timer.
-        telemetry.flush()
+    with record_turn() as turn:
+        try:
+            answer = await asyncio.wait_for(
+                _ask(INSTRUCTION, prompt, operation, run_id, tools=AGENT_TOOLS),
+                timeout=AGENT_TIMEOUT_SECONDS)
+            if not answer:
+                log.warning("agent %s returned no text", operation)
+                answer = _unfinished_reply(run_id, turn)
+        except asyncio.TimeoutError:
+            _agent_timed_out(operation)
+            answer = _unfinished_reply(run_id, turn)
+        except Exception as exc:  # noqa: BLE001 - fall back rather than fail the request
+            _agent_failed(operation, exc)
+            answer = _unfinished_reply(run_id, turn)
+        finally:
+            # The agent's spans are the point of this exercise and Cloud Run can
+            # take the CPU away as soon as the response is written, so they go
+            # out now rather than on the batch processor's timer.
+            telemetry.flush()
+
+    ended_on_simulation = bool(turn.actions) and turn.actions[-1]["tool"] == "simulate_what_if"
+    return {
+        "answer": answer,
+        "new_run_id": turn.new_run_ids[-1] if turn.new_run_ids else None,
+        "last_simulation": turn.last_simulation if ended_on_simulation else None,
+        "actions": turn.actions,
+    }
+
+
+async def explain(run_id: str, question: str) -> str:
+    """One stateless request - the same agent as chat(), without a transcript."""
+    return (await chat(run_id, question, operation="explain"))["answer"]
 
 
 async def draft_memo(run_id: str) -> str:
@@ -237,7 +424,7 @@ async def draft_memo(run_id: str) -> str:
     )
     try:
         return await asyncio.wait_for(
-            _ask(MEMO_INSTRUCTION, prompt, "draft_memo", run_id),
+            _ask(MEMO_INSTRUCTION, prompt, "draft_memo", run_id, tools=READ_TOOLS),
             timeout=AGENT_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         _agent_timed_out("draft_memo")

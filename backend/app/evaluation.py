@@ -6,6 +6,7 @@ run. The engine itself never sees a session.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -22,6 +23,7 @@ from .models import (
     ApprovedSupplier, Benchmark, ComplianceRequirement, Demand, EvaluationRun,
     FreightPolicy, HistoricalPrice, Material, PolicyConfig, Quote, Supplier,
 )
+from .reference_action import REMOVED, ChangeSet, apply_change_set
 
 from . import telemetry
 
@@ -36,16 +38,30 @@ class EvaluationError(RuntimeError):
     pass
 
 
-def build_policy(session: Session) -> Policy:
+def build_policy(session: Session, changes: ChangeSet | None = None) -> Policy:
+    """The Policy in force, optionally with a what-if ChangeSet laid over it.
+
+    Overrides are applied to the rows before the Policy is built, so a
+    simulated threshold goes through exactly the same construction as a
+    stored one.
+    """
     cfg = {row.key: Decimal(str(row.value)) for row in session.scalars(select(PolicyConfig))}
     if not cfg:
         raise EvaluationError("policy configuration is empty; reference data not seeded")
+    if changes:
+        cfg.update(changes.policy)
 
     freight = {
         row.incoterm: (Decimal(str(row.freight_adj_pct)), row.basis_note)
         for row in session.scalars(select(FreightPolicy))
     }
-    requirements = list(session.scalars(select(ComplianceRequirement)))
+    # Copied out of the ORM rows rather than edited on them: an override set
+    # on a row would be flushed by the next commit and become real policy.
+    tiers = changes.compliance if changes else {}
+    requirements = [
+        (r.code, r.label, tiers.get(r.code, r.tier))
+        for r in session.scalars(select(ComplianceRequirement))
+    ]
 
     return Policy(
         fx={"USD": cfg["fx_usd_eur"]},
@@ -59,20 +75,22 @@ def build_policy(session: Session) -> Policy:
         max_vendor_share_pct=cfg["max_vendor_share_pct"],
         freight_by_incoterm=freight,
         mandatory_requirements=tuple(
-            r.code for r in requirements if r.tier == "MANDATORY"),
+            code for code, _, tier in requirements if tier == "MANDATORY"),
         advisory_requirements=tuple(
-            r.code for r in requirements if r.tier == "ADVISORY"),
-        requirement_labels={r.code: r.label for r in requirements},
+            code for code, _, tier in requirements if tier == "ADVISORY"),
+        requirement_labels={
+            code: label for code, label, tier in requirements if tier != REMOVED},
     )
 
 
-def load_reference(session: Session):
+def load_reference(session: Session, changes: ChangeSet | None = None):
     materials = {
         m.cas_no: MaterialRef(m.cas_no, m.name, _d(m.density_kg_per_l))
         for m in session.scalars(select(Material))
     }
+    volumes = changes.volumes if changes else {}
     demand = {
-        d.cas_no: DemandLine(d.cas_no, _d(d.required_qty_l))
+        d.cas_no: DemandLine(d.cas_no, volumes.get(d.cas_no, _d(d.required_qty_l)))
         for d in session.scalars(select(Demand))
     }
     benchmarks = {
@@ -80,6 +98,10 @@ def load_reference(session: Session):
             b.cas_no, _d(b.ceiling_price_eur_l), _d(b.target_price_eur_l))
         for b in session.scalars(select(Benchmark))
     }
+    for cas_no, ceiling in (changes.ceilings if changes else {}).items():
+        current = benchmarks.get(cas_no)
+        benchmarks[cas_no] = (replace(current, ceiling_price_eur_l=ceiling)
+                              if current else BenchmarkRef(cas_no, ceiling))
     historical = {
         h.cas_no: HistoricalRef(
             cas_no=h.cas_no,
@@ -154,7 +176,15 @@ def to_quote_input(
     )
 
 
-def run_evaluation(session: Session, comparison_id: str) -> EvaluationRun:
+def _prepare(session: Session, comparison_id: str, changes: ChangeSet | None = None):
+    """Load everything evaluate() needs for one basket, resolved from the DB.
+
+    Shared by run_evaluation() (which persists the result) and simulate()
+    (which does not) - both call the same engine on the same real inputs, so
+    a simulated "what if" and a real run can never quietly drift apart from
+    duplicated loading logic. `changes` is laid over the reference data in
+    memory only; nothing here writes.
+    """
     quotes = list(session.scalars(
         select(Quote).where(
             Quote.comparison_id == comparison_id,
@@ -178,8 +208,8 @@ def run_evaluation(session: Session, comparison_id: str) -> EvaluationRun:
             + ". Remove the older document and evaluate again."
         )
 
-    policy = build_policy(session)
-    materials, demand, benchmarks, historical = load_reference(session)
+    policy = build_policy(session, changes)
+    materials, demand, benchmarks, historical = load_reference(session, changes)
     # Measured vendor share from the PO history, for the concentration check.
     incumbent = vendor_spend(session)
 
@@ -189,28 +219,84 @@ def run_evaluation(session: Session, comparison_id: str) -> EvaluationRun:
         supplier = session.get(Supplier, quote.supplier_id)
         quote_inputs.append(to_quote_input(quote, supplier, approved))
 
+    return {
+        "quotes": quotes,
+        "quote_inputs": quote_inputs,
+        "materials": materials,
+        "demand": demand,
+        "benchmarks": benchmarks,
+        "historical": historical,
+        "incumbent": incumbent,
+        "policy": policy,
+    }
+
+
+def _evaluate(inputs: dict) -> dict:
+    return evaluate(
+        quotes=inputs["quote_inputs"],
+        materials=inputs["materials"],
+        demand=inputs["demand"],
+        benchmarks=inputs["benchmarks"],
+        policy=inputs["policy"],
+        historical=inputs["historical"],
+        incumbent_spend=inputs["incumbent"],
+        engine_version=settings.engine_version,
+    )
+
+
+def run_evaluation(session: Session, comparison_id: str) -> EvaluationRun:
+    inputs = _prepare(session, comparison_id)
+
     with telemetry.tracer().start_as_current_span("engine.evaluate") as span:
         span.set_attribute("comparison.id", comparison_id)
-        span.set_attribute("quote.count", len(quotes))
+        span.set_attribute("quote.count", len(inputs["quotes"]))
         span.set_attribute("engine.version", settings.engine_version)
-        result = evaluate(
-            quotes=quote_inputs,
-            materials=materials,
-            demand=demand,
-            benchmarks=benchmarks,
-            policy=policy,
-            historical=historical,
-            incumbent_spend=incumbent,
-            engine_version=settings.engine_version,
-        )
+        result = _evaluate(inputs)
 
     run = EvaluationRun(
         comparison_id=comparison_id,
-        quote_ids=[q.quote_id for q in quotes],
-        policy_snapshot=policy.to_dict(),
+        quote_ids=[q.quote_id for q in inputs["quotes"]],
+        policy_snapshot=inputs["policy"].to_dict(),
         engine_version=settings.engine_version,
         result=result,
     )
     session.add(run)
     session.commit()
     return run
+
+
+def simulate(session: Session, comparison_id: str,
+             changes: ChangeSet | None = None) -> dict:
+    """Re-run the real engine on this basket's real inputs, without saving.
+
+    Four independent kinds of "what if" exist and are easy to conflate, which
+    is why a ChangeSet keeps them apart: a rule threshold such as
+    ceiling_materiality_pct, one material's ceiling price in EUR/L, one
+    material's required volume in litres, and a checklist code's tier
+    (MANDATORY, ADVISORY or REMOVED). "What if the ceiling for sulfuric acid
+    were lower" is the second kind; "what if SDS became mandatory" is the
+    fourth.
+
+    Nothing is written: no EvaluationRun row, no change to policy_config,
+    benchmark, demand or compliance_requirement. This is what makes a "what
+    if" question answerable without touching the numbers every other
+    evaluation relies on. With no changes it evaluates the policy in force
+    today, which is the baseline a simulation is compared against.
+    """
+    with telemetry.tracer().start_as_current_span("engine.simulate") as span:
+        span.set_attribute("comparison.id", comparison_id)
+        return _evaluate(_prepare(session, comparison_id, changes))
+
+
+def apply_changes_and_evaluate(
+    session: Session, comparison_id: str, changes: ChangeSet
+) -> EvaluationRun:
+    """Make a ChangeSet real, then evaluate the basket under it.
+
+    The simulation first is a dry run: if the changed policy cannot be
+    evaluated at all, nothing is written, rather than leaving policy changed
+    with no run to show for it.
+    """
+    simulate(session, comparison_id, changes)
+    apply_change_set(session, changes)
+    return run_evaluation(session, comparison_id)

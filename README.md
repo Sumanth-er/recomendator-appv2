@@ -41,6 +41,30 @@ Extraction, normalization and validation run as one background job per upload;
 the browser polls document status. Evaluation is synchronous and takes
 milliseconds.
 
+## The agent
+
+One input box under the dashboard, one agent behind it (also served over A2A
+when `A2A_ENABLED=1`). Each request is one of three kinds, and the agent picks:
+
+| Request | What happens | Saved? |
+|---|---|---|
+| "Why is Alpha ranked above Beta?" | Read tools over the stored run | Nothing |
+| "What if the ceiling materiality threshold were 7%?" | `simulate_what_if` runs the real engine on the real quotes with the change laid over the policy in memory, and compares the outcome with today's policy. The reply offers *Apply this change* | Nothing |
+| "Make REACH mandatory", "lower the sulfuric acid ceiling by 10%", "apply that" | `apply_changes` validates, saves the change, and re-evaluates the basket into a new run | Policy, and a new run |
+
+What can change: any rule threshold in `policy_config`, a material's ceiling
+price or required volume, and a checklist code's tier (mandatory, advisory or
+removed). A brand-new checklist requirement can be added too, but creates no run:
+quotes already extracted were never checked against it, so the documents need
+reprocessing first.
+
+The model still does no arithmetic. Changes are passed as `KEY=VALUE` strings;
+a relative change ("+2", "-10%") is resolved in `reference_action.py`, and the
+before-and-after comparison is computed in `agent/tools.py`. Simulation and apply
+share one parser, so what is simulated is exactly what gets applied. Policy is
+shared: a change applies to every future evaluation in every comparison, while
+existing runs keep the policy they were evaluated with.
+
 ## Deploying
 
 ```bash
@@ -94,7 +118,9 @@ backend/app/
     ranking.py    base rank, promotion rule, award allocation
     runner.py     orchestrates the above into one run result
   ingest/       Document AI, Gemini, category strategy, historical CSV, checks
-  agent/        ADK agent and its read-only tools over a stored run
+  agent/        ADK agent: read tools over a stored run, what-if simulation,
+                and policy changes on request
+  reference_action.py  one validation path for every policy change
   render/       deterministic approval memo
   api/          HTTP routes
   models.py     schema - created on startup, no separate .sql file

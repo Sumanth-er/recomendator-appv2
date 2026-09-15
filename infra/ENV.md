@@ -44,6 +44,8 @@ for role in roles/cloudsql.client roles/storage.objectAdmin roles/documentai.api
 | `VERTEX_LOCATION` | no | `global` | Gemini availability is region specific; `global` works everywhere |
 | `VERTEX_MODEL` | no | `gemini-2.5-flash` | |
 | `AGENT_TIMEOUT_SECONDS` | no | `120` | Budget for one agent call. Past it the deterministic answer is used. Keep it under the nginx (300s) and Cloud Run request timeouts |
+| `A2A_ENABLED` | no | off | `1` adds the Agent2Agent surface: the card at `/.well-known/agent-card.json`, JSON-RPC at `/a2a`. See below |
+| `A2A_PUBLIC_URL` | with A2A | `http://localhost:8080` | Base URL the agent card advertises — the backend's Cloud Run URL, no trailing slash |
 | `DATABASE_URL` | no | — | Full SQLAlchemy URL. If set it overrides every `DB_*` and `INSTANCE_CONNECTION_NAME` value above |
 | `PLANT_NAME` | no | — | Site named on the approval package. Unset, the destination clause is omitted |
 | `PORT` | no | `8080` | Cloud Run sets this itself — do not override |
@@ -66,6 +68,22 @@ Trace Explorer.
 `config.configure_agent_env()` derives them at start-up with `setdefault`, so
 setting any of them explicitly still wins. Set them only to point the agent at
 a different project or region than Document AI and Storage use.
+
+### A2A
+
+With `A2A_ENABLED=1` the same agent the dashboard chat uses is served over
+Agent2Agent, from the same process. It needs `a2a-sdk` (pinned in
+`requirements.txt`; ADK 1.36 requires the 0.3 line, and 1.x does not work).
+
+- The caller must put the evaluation run id in its message. Without one the
+  agent asks for it rather than guessing.
+- The agent can change policy over A2A exactly as it can in the chat, and only
+  when the message asks for a change. There is no authentication on either
+  surface in this POC.
+- Tasks and sessions live in memory. They are per instance and lost on restart,
+  so a multi-turn A2A conversation that lands on a different Cloud Run instance
+  starts over. Evaluation runs and policy changes are in the database and are
+  not affected.
 
 ## Telemetry
 

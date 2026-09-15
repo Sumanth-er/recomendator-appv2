@@ -115,11 +115,22 @@ def _dec(value) -> Decimal | None:
     text = re.sub(r"[^\d.,-]", "", str(value))
     if not text:
         return None
-    # A comma before one or two trailing digits is a decimal separator.
-    if re.search(r",\d{1,2}$", text) and "." not in text:
-        text = text.replace(".", "").replace(",", ".")
-    else:
-        text = text.replace(",", "")
+    if "," in text and "." in text:
+        # Whichever separator comes last is the decimal one:
+        # "1.234,56" (SAP with a German locale) and "1,234.56" (English).
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        head, _, tail = text.rpartition(",")
+        # Only "1,234" and "12,345,678" read as thousands. A price such as
+        # "0,8352" or "3,20" is a decimal comma - treating it as a separator
+        # turned 0,8352 EUR/L into 8352.
+        grouped = len(tail) == 3 and re.fullmatch(r"-?[1-9]\d{0,2}(,\d{3})*", head)
+        text = text.replace(",", "") if grouped else head.replace(",", "") + "." + tail
+    elif text.count(".") > 1:
+        text = text.replace(".", "")    # "12.345.678" - dots as thousands
     try:
         return Decimal(text)
     except (InvalidOperation, ValueError):

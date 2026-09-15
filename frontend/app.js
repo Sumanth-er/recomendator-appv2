@@ -4,7 +4,7 @@
  * already stored on the run, which is why derived figures can be labelled as
  * derived and traced back to the quote they came from.
  */
-const HIDDEN_COMPLIANCE = new Set(["TSCA"]);
+const HIDDEN_COMPLIANCE = new Set();
 const API = "/api";
 const view = document.getElementById("view");
 
@@ -787,22 +787,29 @@ async function run(runId) {
         <td class="num">${eur(d.line_total_recomputed)}</td></tr>`).join("")}
       </tbody></table></div></div>` : ""}
 
-    <h2>Ask about this recommendation</h2>
+    <h2>Sourcing agent</h2>
     <div class="card chat">
-      <p class="chat-intro">The agent answers from this run only. It reads the stored
-      figures and the gate trail — it cannot recalculate or consider other quotes.</p>
+      <div class="spread">
+        <p class="chat-intro">Ask about this recommendation, explore a what-if, or tell
+        the agent to change a rule threshold, a ceiling price, a required volume or a
+        compliance requirement. A what-if is never saved. A change you ask for is saved
+        to the policy in force and the basket is re-evaluated into a new run; this run
+        stays as it is.</p>
+        <button class="link small nowrap" id="agent-reset" hidden>New conversation</button>
+      </div>
+      <div id="agent-note"></div>
+      <div id="agent-history"></div>
       <div class="chips" id="suggested"></div>
       <div class="ask-row">
         <input type="text" id="question" autocomplete="off"
-          placeholder="Ask anything about this comparison…">
-        <button class="primary" id="ask-btn">Ask</button>
+          placeholder="Ask, simulate or change - e.g. make SDS_LANGUAGE mandatory">
+        <button class="primary" id="ask-btn">Send</button>
       </div>
-      <div id="answer"></div>
     </div>
 
     ${footerNotes(r)}`;
 
-  wireAgent(runId, r);
+  wireAgent(runId, data);
   document.getElementById("package-btn").onclick = () => {
     location.hash = `#/run/${runId}/package`;
   };
@@ -821,56 +828,202 @@ async function run(runId) {
   fillNotes(runId);          // prose arrives after the numbers; never blocks
 }
 
-function wireAgent(runId, r) {
+/* One agent, one input. It explains the run, simulates what-ifs and applies
+ * policy changes; the backend decides which, and says what it did:
+ * new_run_id when a change was saved and the basket re-evaluated,
+ * last_simulation - the exact arguments that would apply it - when the reply
+ * is an unsaved what-if. The conversation belongs to the comparison, not to
+ * this run, so it carries on across the runs the agent creates. */
+
+const CHANGE_LABELS = {
+  policy_changes: "threshold",
+  ceiling_price_changes: "ceiling price",
+  volume_changes: "required volume",
+  compliance_changes: "compliance",
+};
+
+// localStorage can be unavailable (private windows, blocked storage). The chat
+// still works then; it just starts a fresh conversation on every visit.
+const chatStore = {
+  get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(key, value); } catch { /* ignore */ } },
+  remove(key) { try { localStorage.removeItem(key); } catch { /* ignore */ } },
+};
+
+function wireAgent(runId, data) {
+  const r = data.result;
+  const comparisonId = data.comparison_id;
+  const sessionKey = `chat-session:${comparisonId}`;
+  const $ = (id) => document.getElementById(id);
+  const historyEl = $("agent-history");
+  let currentRunId = runId;   // moves on when the agent creates a newer run
+  let busy = false;
+
   const primary = r.suppliers.find((s) => s.final_rank === 1);
   const cheaper = r.suppliers.find((s) => s.base_rank === 1);
   const excluded = r.suppliers.find((s) => !s.eligible);
+  const failedGate3 = r.suppliers.find((s) => s.failed_gate === 3);
+  const failedGate1 = r.suppliers.find((s) => s.failed_gate === 1);
 
   const suggestions = [];
   if (primary && cheaper && primary.supplier_id !== cheaper.supplier_id) {
     suggestions.push(`Why is ${primary.supplier_name} ranked above ${cheaper.supplier_name} when ${cheaper.supplier_name} is cheaper?`);
   }
-  if (excluded) suggestions.push(`Why was ${excluded.supplier_name} excluded?`);
+  if (excluded) {
+    suggestions.push(excluded.failed_gate === 3
+      ? `Why is ${excluded.supplier_name} not recommended?`
+      : `Why was ${excluded.supplier_name} excluded?`);
+  }
+  if (failedGate3) {
+    suggestions.push("What if the ceiling materiality threshold were 2 points higher?");
+  } else if (failedGate1) {
+    const gap = (((r.gates[failedGate1.supplier_id] || [])[0] || {}).detail || {}).gaps || [];
+    if (gap.length) suggestions.push(`What if ${gap[0]} were advisory instead of mandatory?`);
+  }
   suggestions.push("Which line items should I prioritise in negotiation?");
   suggestions.push("What compliance gaps exist across the suppliers?");
 
-  document.getElementById("suggested").innerHTML =
+  $("suggested").innerHTML =
     suggestions.map((q) => `<button class="chip" data-q="${esc(q)}">${esc(q)}</button>`).join("");
 
-  const $ = (id) => document.getElementById(id);
-  let busy = false;
+  const newRunBanner = (newRunId) => `
+    <div class="banner ok agent-banner">Saved. The basket was re-evaluated into a new run.
+      <a href="#/run/${esc(newRunId)}">Open the updated dashboard</a></div>`;
 
-  async function ask(question) {
-    if (busy || !question.trim()) return;
+  // Once the agent has created a newer run, questions go to that run - but
+  // this page still shows the old one, which has to be said.
+  function followRun(newRunId) {
+    currentRunId = newRunId;
+    $("agent-note").innerHTML = newRunId === runId ? "" : `
+      <div class="banner warn agent-banner">The conversation has moved on to run
+        ${esc(newRunId.slice(0, 8))}; this page still shows run ${esc(runId.slice(0, 8))}.
+        <a href="#/run/${esc(newRunId)}">Open the new run</a></div>`;
+  }
+
+  function describeChanges(args) {
+    return Object.entries(CHANGE_LABELS)
+      .flatMap(([field, label]) => (args[field] || []).map((c) => `${label} ${c}`))
+      .join(", ");
+  }
+
+  function renderReply(block, answer, newRunId, simulation) {
+    block.querySelector(".qa-thinking")?.remove();
+    block.insertAdjacentHTML("beforeend", `<div class="answer">${markdown(answer)}</div>`);
+    if (newRunId) {
+      block.insertAdjacentHTML("beforeend", newRunBanner(newRunId));
+    } else if (simulation && describeChanges(simulation)) {
+      block.insertAdjacentHTML("beforeend", `
+        <div class="apply-row">
+          <button class="apply-btn">Apply this change</button>
+          <span class="apply-args">${esc(describeChanges(simulation))}</span>
+        </div>`);
+      const button = block.querySelector(".apply-btn");
+      button.onclick = () => applySimulation(button, simulation);
+    }
+  }
+
+  async function ensureSession() {
+    const existing = chatStore.get(sessionKey);
+    if (existing) return existing;
+    const created = await api(`/comparisons/${comparisonId}/chat/sessions`, { method: "POST" });
+    chatStore.set(sessionKey, created.session_id);
+    $("agent-reset").hidden = false;
+    return created.session_id;
+  }
+
+  async function applySimulation(button, simulation) {
+    if (busy) return;
+    busy = true;
+    button.disabled = true;
+    button.textContent = "Applying…";
+    try {
+      const sessionId = await ensureSession();
+      const result = await api("/reference/apply-and-rerun", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ comparison_id: comparisonId, session_id: sessionId, ...simulation }),
+      });
+      button.closest(".apply-row").outerHTML = newRunBanner(result.run_id);
+      followRun(result.run_id);
+      toast("Change saved and a new evaluation run created");
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = "Apply this change";
+      toast(err.message);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function loadHistory() {
+    const sessionId = chatStore.get(sessionKey);
+    if (!sessionId) return;
+    let data;
+    try {
+      data = await api(`/chat/sessions/${sessionId}/messages`);
+    } catch {
+      chatStore.remove(sessionKey);   // the session is gone; start a new one on ask
+      return;
+    }
+    let block = null;
+    for (const m of data.messages) {
+      if (m.role === "user" || !block) {
+        block = document.createElement("div");
+        block.className = "qa";
+        historyEl.appendChild(block);
+      }
+      if (m.role === "user") {
+        block.innerHTML = `<p class="qa-q">${esc(m.content)}</p>`;
+      } else {
+        renderReply(block, m.content, m.resulting_run_id, null);
+      }
+    }
+    $("agent-reset").hidden = !data.messages.length;
+  }
+
+  async function send(sessionId, question) {
+    return api(`/chat/sessions/${sessionId}/ask?run_id=${encodeURIComponent(currentRunId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+  }
+
+  async function ask(text) {
+    const question = (text || "").trim();
+    if (busy || !question) return;
     busy = true;
     $("ask-btn").disabled = true;
-    $("question").value = question;
+    $("question").value = "";
+    // A question sent while the saved conversation is still loading would
+    // otherwise render above the history it follows.
+    await historyReady.catch(() => {});
 
     // The question is echoed above the answer so a long reply still says what
     // it is replying to, and the wait has something to sit under.
-    $("answer").innerHTML = `
-      <div class="qa">
-        <p class="qa-q">${esc(question)}</p>
-        <p class="qa-thinking">Reading the stored run<span class="dots"></span></p>
-      </div>`;
+    const block = document.createElement("div");
+    block.className = "qa";
+    block.innerHTML = `<p class="qa-q">${esc(question)}</p>
+      <p class="qa-thinking">Working on it<span class="dots"></span></p>`;
+    historyEl.appendChild(block);
+    block.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
     try {
-      const response = await api(`/runs/${runId}/ask`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
-      });
-      $("answer").innerHTML = `
-        <div class="qa">
-          <p class="qa-q">${esc(question)}</p>
-          <div class="answer">${markdown(response.answer)}</div>
-        </div>`;
+      let response;
+      try {
+        response = await send(await ensureSession(), question);
+      } catch (err) {
+        // A session removed on the server (the comparison was deleted and
+        // recreated, the database was reset): start a new one and resend.
+        if (!/chat session not found/i.test(err.message)) throw err;
+        chatStore.remove(sessionKey);
+        response = await send(await ensureSession(), question);
+      }
+      renderReply(block, response.answer, response.new_run_id, response.last_simulation);
+      if (response.new_run_id) followRun(response.new_run_id);
     } catch (err) {
-      $("answer").innerHTML = `
-        <div class="qa">
-          <p class="qa-q">${esc(question)}</p>
-          <div class="banner bad">${esc(err.message)}</div>
-        </div>`;
+      block.querySelector(".qa-thinking")?.remove();
+      block.insertAdjacentHTML("beforeend", `<div class="banner bad">${esc(err.message)}</div>`);
     } finally {
       busy = false;
       $("ask-btn").disabled = false;
@@ -878,10 +1031,21 @@ function wireAgent(runId, r) {
   }
 
   $("ask-btn").onclick = () => ask($("question").value);
-  $("question").onkeydown = (e) => { if (e.key === "Enter") ask(e.target.value); };
+  $("question").onkeydown = (e) => {
+    if (e.key === "Enter" && !e.isComposing) ask(e.target.value);
+  };
   document.querySelectorAll("[data-q]").forEach((b) => {
     b.onclick = () => ask(b.dataset.q);
   });
+  $("agent-reset").onclick = () => {
+    if (busy) return;
+    chatStore.remove(sessionKey);
+    historyEl.innerHTML = "";
+    $("agent-reset").hidden = true;
+    followRun(runId);
+  };
+
+  const historyReady = loadHistory();
 }
 
 /* --------------------------------------------------------- approval package */
@@ -989,12 +1153,28 @@ async function reference() {
     </div>
 
     <h2>Rule thresholds and constants</h2>
-    <div class="card scroll"><table><thead><tr><th>Key</th><th class="num">Value</th><th>Unit</th><th>Meaning</th><th>Section</th></tr></thead><tbody>
-      ${data.policy.map((p) => `<tr><td><code>${esc(p.key)}</code></td>
-        <td class="num">${p.value}</td><td>${esc(p.unit || "")}</td>
-        <td class="small">${esc(p.description)}</td>
-        <td class="muted small">${esc(p.section_ref || "")}</td></tr>`).join("")}
-    </tbody></table></div>
+    
+    <div class="card scroll">
+      <table><thead><tr><th>Key</th><th class="num">Value</th><th>Unit</th><th>Meaning</th><th>Section</th></tr></thead>
+      <tbody>
+        ${data.policy.map((p) => `<tr>
+          <td><code>${esc(p.key)}</code></td>
+          <td class="num"><input type="number" step="any" class="policy-input"
+              data-key="${esc(p.key)}" data-original="${esc(p.value)}"
+              value="${esc(p.value)}" style="width:100px;text-align:right"></td>
+          <td>${esc(p.unit || "")}</td>
+          <td class="small">${esc(p.description)}</td>
+          <td class="muted small">${esc(p.section_ref || "")}</td>
+        </tr>`).join("")}
+      </tbody></table>
+      <div class="row" style="margin-top:12px;align-items:center;gap:10px">
+        <button class="primary" id="policy-save">Save changes</button>
+        <span class="small muted" id="policy-status"></span>
+      </div>
+      <p class="small muted" style="margin-top:8px">A change here applies to the next
+        evaluation only. Every past run keeps the thresholds it was actually run
+        with, so nothing already approved changes retroactively.</p>
+    </div>
 
     <h2>Materials, prices and required volumes</h2>
     <div class="card scroll"><table><thead><tr><th>CAS</th><th>Material</th>
@@ -1073,14 +1253,36 @@ async function reference() {
         : `<p class="muted small" style="margin-top:12px">No extract loaded yet.</p>`}
     </div>
 
+    
     <h2>Compliance checklist</h2>
-    <div class="card"><table><thead><tr><th>Code</th><th>Requirement</th><th>Tier</th></tr></thead><tbody>
-            ${data.compliance_requirements.filter((c) => !HIDDEN_COMPLIANCE.has(c.code)).map((c) => `<tr><td><code>${esc(c.code)}</code></td>
-        <td>${esc(c.label)}</td>
-        <td><span class="pill ${c.tier === "MANDATORY" ? "bad" : "info"}">${esc(c.tier.toLowerCase())}</span></td></tr>`).join("")}
+    <div class="card"><table><thead><tr><th>Code</th><th>Requirement</th><th>Tier</th><th></th></tr></thead>
+      <tbody id="compliance-rows">
+        ${data.compliance_requirements.filter((c) => !HIDDEN_COMPLIANCE.has(c.code)).map((c) => `<tr data-code="${esc(c.code)}">
+          <td><code>${esc(c.code)}</code>${c.manual_override ? ' <span class="pill" style="font-size:10px">manual</span>' : ""}</td>
+          <td><input type="text" class="compliance-label" value="${esc(c.label)}" style="width:100%"></td>
+          <td><select class="compliance-tier">
+            <option value="MANDATORY" ${c.tier === "MANDATORY" ? "selected" : ""}>mandatory</option>
+            <option value="ADVISORY" ${c.tier === "ADVISORY" ? "selected" : ""}>advisory</option>
+          </select></td>
+          <td><button class="ghost small compliance-remove" data-code="${esc(c.code)}">Remove</button></td>
+        </tr>`).join("")}
+        <tr id="compliance-new-row">
+          <td><input type="text" id="compliance-new-code" placeholder="NEW_CODE" style="width:100%"></td>
+          <td><input type="text" id="compliance-new-label" placeholder="Requirement label" style="width:100%"></td>
+          <td><select id="compliance-new-tier">
+            <option value="MANDATORY">mandatory</option>
+            <option value="ADVISORY" selected>advisory</option>
+          </select></td>
+          <td><button class="ghost small" id="compliance-add">+ Add</button></td>
+        </tr>
     </tbody></table>
+    <div class="row" style="margin-top:12px;align-items:center;gap:10px">
+      <button class="primary" id="compliance-save">Save changes</button>
+      <span class="small muted" id="compliance-status"></span>
+    </div>
     <p class="small muted" style="margin-top:10px">Mandatory items drive Gate 1 exclusion. Advisory items drive the
-    compliance condition of the promotion rule.</p></div>`;
+    compliance condition of the promotion rule. A tier change or a new code applies to the next document processed,
+    not to quotes already extracted. A new code needs a clear requirement label so extraction knows what to look for.</p></div>`;
 
   const strategyFile = document.getElementById("strategy-file");
   document.getElementById("strategy-pick").onclick = () => strategyFile.click();
@@ -1128,6 +1330,115 @@ async function reference() {
     await api("/reference/historical", { method: "DELETE" });
     route();
   };
+
+    const policyStatus = document.getElementById("policy-status");
+  document.getElementById("policy-save").onclick = async () => {
+    const changed = [...document.querySelectorAll(".policy-input")]
+      .filter((el) => el.value !== "" && el.value !== el.dataset.original)
+      .map((el) => ({ key: el.dataset.key, value: Number(el.value) }));
+
+    if (!changed.length) {
+      policyStatus.textContent = "No changes to save.";
+      return;
+    }
+
+    policyStatus.textContent = "Saving…";
+    try {
+      const result = await api("/reference/policy", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates: changed }),
+      });
+      if (result.errors.length) {
+        policyStatus.textContent = result.errors
+          .map((e) => `${e.key}: ${e.error}`).join("; ");
+      } else {
+        toast(`${result.updated.length} threshold(s) updated — applies from the `
+              + `next evaluation.`);
+        route();
+      }
+    } catch (err) {
+      policyStatus.textContent = err.message;
+    }
+  };
+
+  const complianceStatus = document.getElementById("compliance-status");
+  document.getElementById("compliance-save").onclick = async () => {
+    const updates = [...document.querySelectorAll("#compliance-rows tr[data-code]")]
+      .map((tr) => ({
+        code: tr.dataset.code,
+        label: tr.querySelector(".compliance-label").value.trim(),
+        tier: tr.querySelector(".compliance-tier").value,
+      }));
+
+    complianceStatus.textContent = "Saving…";
+    try {
+      const result = await api("/reference/compliance", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates }),
+      });
+      if (result.errors.length) {
+        complianceStatus.textContent = result.errors
+          .map((e) => `${e.code}: ${e.error}`).join("; ");
+      } else {
+        toast(`${result.updated.length} requirement(s) updated — applies from the `
+              + `next document processed.`);
+        route();
+      }
+    } catch (err) {
+      complianceStatus.textContent = err.message;
+    }
+  };
+
+  document.getElementById("compliance-add").onclick = async () => {
+    const code = document.getElementById("compliance-new-code").value.trim();
+    const label = document.getElementById("compliance-new-label").value.trim();
+    const tier = document.getElementById("compliance-new-tier").value;
+
+    if (!code || !label) {
+      complianceStatus.textContent = "A new requirement needs a code and a label.";
+      return;
+    }
+
+    complianceStatus.textContent = "Adding…";
+    try {
+      const result = await api("/reference/compliance", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates: [{ code, label, tier }] }),
+      });
+      if (result.errors.length) {
+        complianceStatus.textContent = result.errors
+          .map((e) => `${e.code}: ${e.error}`).join("; ");
+      } else {
+        toast(`Added ${result.created[0].code}.`);
+        route();
+      }
+    } catch (err) {
+      complianceStatus.textContent = err.message;
+    }
+  };
+  document.querySelectorAll(".compliance-remove").forEach((btn) => {
+    btn.onclick = async () => {
+      const code = btn.dataset.code;
+      if (!confirm(`Remove "${code}" from the compliance checklist?\n\nThis `
+                   + `stops it gating future evaluations. Runs and quotes `
+                   + `already extracted keep the compliance data they have.`)) {
+        return;
+      }
+
+      complianceStatus.textContent = "Removing…";
+      try {
+        await api(`/reference/compliance/${encodeURIComponent(code)}`, { method: "DELETE" });
+        toast(`Removed ${code}.`);
+        route();
+      } catch (err) {
+        complianceStatus.textContent = err.message;
+      }
+    };
+  });
+
 }
 
 /* ------------------------------------------------------- markdown rendering */
@@ -1155,10 +1466,18 @@ function markdown(text) {
     }
     if (inTable) { out.push("</tbody></table>"); inTable = false; }
 
-    if (/^### /.test(line)) out.push(`<h3>${inline(line.slice(4))}</h3>`);
+    // The agent writes "*" bullets, numbered lists and nested items as often
+    // as "-" bullets; indentation is kept so a nested list still reads as one.
+    const bullet = line.match(/^(\s*)[-*] (.*)$/);
+    const numbered = line.match(/^(\s*)(\d+)[.)] (.*)$/);
+    const indent = (spaces) => 14 + Math.min(Math.floor(spaces.length / 2), 3) * 14;
+
+    if (/^#{4,6} /.test(line)) out.push(`<h3>${inline(line.replace(/^#+ /, ""))}</h3>`);
+    else if (/^### /.test(line)) out.push(`<h3>${inline(line.slice(4))}</h3>`);
     else if (/^## /.test(line)) out.push(`<h2>${inline(line.slice(3))}</h2>`);
     else if (/^# /.test(line)) out.push(`<h1>${inline(line.slice(2))}</h1>`);
-    else if (/^- /.test(line)) out.push(`<div style="margin-left:14px">• ${inline(line.slice(2))}</div>`);
+    else if (bullet) out.push(`<div style="margin-left:${indent(bullet[1])}px">• ${inline(bullet[2])}</div>`);
+    else if (numbered) out.push(`<div style="margin-left:${indent(numbered[1])}px">${numbered[2]}. ${inline(numbered[3])}</div>`);
     else if (line === "") out.push("<div style='height:8px'></div>");
     else out.push(`<p>${inline(line)}</p>`);
   }

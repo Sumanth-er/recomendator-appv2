@@ -338,3 +338,12 @@ button.chip:hover:not(:disabled) { border-color: var(--accent); color: var(--acc
 .answer { font-size: 14.5px; line-height: 1.6; }
 .answer table { margin: 8px 0; }
 .answer h2, .answer h3 { font-size: 15px; margin: 14px 0 6px; }
+
+#agent-history:empty { display: none; }
+.chat .spread .chat-intro { flex: 1; }
+.chat .agent-banner { margin: 10px 0 0; }
+.apply-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 10px; }
+.apply-args {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px; color: var(--muted); overflow-wrap: anywhere;
+}

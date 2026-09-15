@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .models import (
-    Benchmark, CategoryStrategy, ComplianceRequirement, Demand, FreightPolicy,
+    Benchmark, CategoryStrategy, ComplianceRequirement, DeletedComplianceCode, Demand, FreightPolicy,
     Material, PolicyConfig,
 )
 
@@ -136,8 +136,17 @@ def seed_reference_data(session: Session) -> None:
     strategy_owns_checklist = session.scalar(
         select(CategoryStrategy).where(CategoryStrategy.is_active.is_(True))
     ) is not None
+    deleted_codes = {
+        row.code for row in session.scalars(select(DeletedComplianceCode))
+    }
+
 
     for code, label, tier, hint in COMPLIANCE:
+        if code in deleted_codes:
+            # Someone removed this one on purpose via the Policy in force
+            # screen. Recreating it here would make deletion pointless -
+            # it would just reappear on the next cold start.
+            continue
         row = session.get(ComplianceRequirement, code)
         if not row:
             session.add(ComplianceRequirement(code=code, label=label, tier=tier,
@@ -148,7 +157,12 @@ def seed_reference_data(session: Session) -> None:
         # A strategy upload can set label and tier; it never sets match_hint.
         # So the hint is always ours to correct, and the other two only while
         # no strategy is in force - re-uploading the strategy is what changes
-        # them after that.
+        # them after that. A manual edit through the Policy in force screen
+        # takes the same protection as a strategy: once someone has set a
+        # code's fields by hand, seed.py stops trying to keep them in sync
+        # with this file, on all three fields including match_hint.
+        if row.manual_override:
+            continue
         if row.match_hint != hint:
             row.match_hint = hint
             updated += 1

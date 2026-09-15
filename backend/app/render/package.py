@@ -27,7 +27,7 @@ from ..models import (
 # stored run - it is just not a decision input for this category, so putting it
 # in front of an approver only invites a question with no answer. Mirrors
 # HIDDEN_COMPLIANCE in frontend/app.js; change both together.
-HIDDEN_REQUIREMENTS = {"TSCA"}
+HIDDEN_REQUIREMENTS : set[str] = set()
 
 
 def visible(codes) -> list[str]:

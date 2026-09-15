@@ -10,6 +10,8 @@ from __future__ import annotations
 from .. import telemetry
 
 import logging
+from datetime import datetime, timezone
+from decimal import Decimal
 
 from fastapi import (
     APIRouter, BackgroundTasks, Depends, File, HTTPException, Response,
@@ -21,16 +23,17 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import SessionLocal, get_session
-from ..evaluation import EvaluationError, run_evaluation
+from ..evaluation import EvaluationError, apply_changes_and_evaluate, run_evaluation
+from .. import reference_action as reference_actions
 from ..ingest import storage
 from ..ingest.pipeline import file_hash, process_document
 from ..ingest.historical import load as load_historical, vendor_spend_summary
 from ..ingest.strategy import apply_strategy, extract_strategy
 from ..models import (
-    ApprovalPackage, ApprovedSupplier, Benchmark, CategoryStrategy, Comparison,
-    ComplianceRequirement, Demand, EvaluationRun, FreightPolicy,
-    HistoricalPrice, HistoricalPurchase, Material, PolicyConfig, Quote,
-    SourceDocument, Supplier,
+    ApprovalPackage, ApprovedSupplier, Benchmark, CategoryStrategy, ChatMessage,
+    ChatSession, Comparison, ComplianceRequirement, Demand, EvaluationRun,
+    FreightPolicy, HistoricalPrice, HistoricalPurchase, Material, PolicyConfig,
+    Quote, RunNotes, SourceDocument, Supplier,
 )
 
 def _process_in_background(document_id: str, parent_ctx=None) -> None:
@@ -168,10 +171,12 @@ def delete_comparison(comparison_id: str, session: Session = Depends(get_session
     """Remove a comparison and everything that hangs off it.
 
     The ORM cascade covers documents, and through them quotes, quote lines and
-    discounts. It does not cover evaluation runs or approval packages: those
-    reference the comparison by id without a relationship, so they have to go
-    explicitly and in that order, or the run rows are left pointing at a
-    comparison that no longer exists.
+    discounts. It does not cover chat sessions, run notes, evaluation runs or
+    approval packages: those reference the comparison or its runs by id
+    without a relationship, so they have to go explicitly and in this order.
+    A chat message can point at a run it created and notes and packages point
+    at their run, so on Postgres deleting the runs first is a foreign key
+    violation.
 
     The source PDFs in Cloud Storage are deliberately left alone. Deleting a
     row is recoverable from a backup; deleting the supplier's original document
@@ -181,6 +186,16 @@ def delete_comparison(comparison_id: str, session: Session = Depends(get_session
     if not comparison:
         raise HTTPException(404, "comparison not found")
 
+    chat_ids = [
+        c.session_id for c in session.scalars(
+            select(ChatSession).where(ChatSession.comparison_id == comparison_id))
+    ]
+    if chat_ids:
+        session.query(ChatMessage).filter(
+            ChatMessage.session_id.in_(chat_ids)).delete(synchronize_session=False)
+        session.query(ChatSession).filter(
+            ChatSession.session_id.in_(chat_ids)).delete(synchronize_session=False)
+
     run_ids = [
         r.run_id for r in session.scalars(
             select(EvaluationRun).where(
@@ -188,6 +203,8 @@ def delete_comparison(comparison_id: str, session: Session = Depends(get_session
     ]
     packages = 0
     if run_ids:
+        session.query(RunNotes).filter(
+            RunNotes.run_id.in_(run_ids)).delete(synchronize_session=False)
         packages = session.query(ApprovalPackage).filter(
             ApprovalPackage.run_id.in_(run_ids)).delete(synchronize_session=False)
     runs = session.query(EvaluationRun).filter(
@@ -524,12 +541,167 @@ def download_package(run_id: str, session: Session = Depends(get_session)):
 @router.post("/runs/{run_id}/ask")
 async def ask_agent(run_id: str, payload: AskRequest,
                     session: Session = Depends(get_session)):
+    """One stateless request to the agent - no transcript is kept.
+
+    The same agent as the dashboard chat, so a request to change policy is
+    acted on here too; new_run_id says when that created a run.
+    """
     if not session.get(EvaluationRun, run_id):
         raise HTTPException(404, "run not found")
 
-    from ..agent.agent import explain
+    from ..agent.agent import chat as agent_chat
 
-    return {"answer": await explain(run_id, payload.question)}
+    reply = await agent_chat(run_id, payload.question, operation="explain")
+    return {"answer": reply["answer"], "new_run_id": reply["new_run_id"],
+            "last_simulation": reply["last_simulation"]}
+
+# ---------------------------------------------------------------------------
+# Chat sessions - a multi-turn conversation scoped to a basket, persisted so
+# it survives landing on a different Cloud Run instance between messages.
+# ---------------------------------------------------------------------------
+
+@router.post("/comparisons/{comparison_id}/chat/sessions")
+def create_chat_session(comparison_id: str, session: Session = Depends(get_session)):
+    if not session.get(Comparison, comparison_id):
+        raise HTTPException(404, "comparison not found")
+
+    chat_session = ChatSession(comparison_id=comparison_id)
+    session.add(chat_session)
+    session.commit()
+    return {"session_id": chat_session.session_id}
+
+
+@router.get("/chat/sessions/{session_id}/messages")
+def get_chat_messages(session_id: str, session: Session = Depends(get_session)):
+    chat_session = session.get(ChatSession, session_id)
+    if not chat_session:
+        raise HTTPException(404, "chat session not found")
+
+    messages = session.scalars(
+        select(ChatMessage).where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.message_id)
+    )
+    return {
+        "comparison_id": chat_session.comparison_id,
+        "messages": [
+            {"role": m.role, "content": m.content, "resulting_run_id": m.resulting_run_id,
+             "created_at": m.created_at.isoformat() if m.created_at else None}
+            for m in messages
+        ],
+    }
+
+
+@router.post("/chat/sessions/{session_id}/ask")
+async def ask_chat_session(session_id: str, payload: AskRequest,
+                           run_id: str, session: Session = Depends(get_session)):
+    """Ask the agent inside a session: explain, simulate, or change policy.
+
+    run_id anchors which run's basket the tools operate on; it can be a
+    different run each call within the same session - a change the agent
+    makes creates a new run, and the conversation carries on about that one.
+
+    The reply carries new_run_id when this turn changed policy and
+    re-evaluated, and last_simulation - the exact arguments that would apply
+    it - when the turn ended on an unsaved what-if.
+    """
+    chat_session = session.get(ChatSession, session_id)
+    if not chat_session:
+        raise HTTPException(404, "chat session not found")
+    run = session.get(EvaluationRun, run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    if run.comparison_id != chat_session.comparison_id:
+        raise HTTPException(400, "that run belongs to a different comparison "
+                                 "than this chat session")
+    if not payload.question.strip():
+        raise HTTPException(400, "the question is empty")
+
+    history = [
+        {"role": m.role, "content": m.content, "actions": m.actions}
+        for m in session.scalars(
+            select(ChatMessage).where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.message_id)
+        )
+    ]
+
+    session.add(ChatMessage(session_id=session_id, role="user", content=payload.question))
+    chat_session.last_active_at = datetime.now(timezone.utc)
+    session.commit()
+
+    from ..agent.agent import chat as agent_chat
+
+    reply = await agent_chat(run_id, payload.question, history)
+
+    session.add(ChatMessage(
+        session_id=session_id, role="agent", content=reply["answer"],
+        resulting_run_id=reply["new_run_id"], actions=reply["actions"] or None,
+    ))
+    session.commit()
+
+    return {
+        "answer": reply["answer"],
+        "run_id": reply["new_run_id"] or run_id,
+        "new_run_id": reply["new_run_id"],
+        "last_simulation": reply["last_simulation"],
+    }
+
+
+class ApplyAndRerunRequest(BaseModel):
+    """What the chat's "Apply this change" button sends under a simulation.
+
+    The same "KEY=VALUE" lists simulate_what_if took - the reply's
+    last_simulation, passed back unchanged - validated by the same parser, so
+    the button applies exactly what was simulated. A deterministic path that
+    does not depend on the model reading its own transcript back correctly.
+    """
+    comparison_id: str
+    policy_changes: list[str] = []
+    ceiling_price_changes: list[str] = []
+    volume_changes: list[str] = []
+    compliance_changes: list[str] = []
+    session_id: str | None = None  # if set, records this action in the transcript
+
+
+@router.post("/reference/apply-and-rerun")
+def apply_and_rerun(payload: ApplyAndRerunRequest, session: Session = Depends(get_session)):
+    if not session.get(Comparison, payload.comparison_id):
+        raise HTTPException(404, "comparison not found")
+
+    changes, errors = reference_actions.parse_changes(
+        session, payload.policy_changes, payload.ceiling_price_changes,
+        payload.volume_changes, payload.compliance_changes)
+    if not errors and changes.is_empty():
+        errors = ["no changes were given"]
+    if errors:
+        raise HTTPException(400, "; ".join(errors))
+
+    try:
+        run = apply_changes_and_evaluate(session, payload.comparison_id, changes)
+    except EvaluationError as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+
+    chat_session = (session.get(ChatSession, payload.session_id)
+                    if payload.session_id else None)
+    if chat_session and chat_session.comparison_id == payload.comparison_id:
+        described = "; ".join(
+            f"{c['kind']} {c['key']}: {c['previous']} to {c['new']}"
+            f"{' ' + c['unit'] if c.get('unit') else ''}"
+            for c in changes.details)
+        session.add(ChatMessage(
+            session_id=payload.session_id, role="agent",
+            content=f"Applied the simulated change ({described}) and created a "
+                    f"new evaluation run.",
+            resulting_run_id=run.run_id,
+            actions=[{"tool": "apply_changes", "arguments": changes.as_arguments(),
+                      "changes": changes.details, "new_run_id": run.run_id}],
+        ))
+        chat_session.last_active_at = datetime.now(timezone.utc)
+        session.commit()
+
+    log.info("apply-and-rerun: comparison=%s new_run=%s changes=%s",
+             payload.comparison_id, run.run_id, changes.as_arguments())
+    return {"run_id": run.run_id, "changes": changes.details}
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +802,86 @@ def clear_historical(session: Session = Depends(get_session)):
     session.commit()
     return {"removed_summary_rows": prices, "removed_po_lines": lines}
 
+# ---------------------------------------------------------------------------
+# Rule thresholds and constants - the policy_config table
+# ---------------------------------------------------------------------------
 
+class PolicyValueUpdate(BaseModel):
+    key: str
+    value: Decimal
+
+
+class PolicyBulkUpdate(BaseModel):
+    updates: list[PolicyValueUpdate]
+
+
+@router.put("/reference/policy")
+def update_policy(payload: PolicyBulkUpdate, session: Session = Depends(get_session)):
+    """Edit rule thresholds and constants from the Policy in force screen.
+
+    Every evaluation run snapshots the policy in force at the time it ran
+    (EvaluationRun.policy_snapshot), so a change here never rewrites an
+    earlier run's stored figures - it only takes effect on the next
+    evaluation. The validation itself lives in reference_actions, shared with
+    the agent's own apply-and-rerun action - one set of rules, not two that
+    can drift apart.
+    """
+    result = reference_actions.apply_policy_updates(
+        session, [u.model_dump() for u in payload.updates])
+    if result["updated"]:
+        log.info("policy_config updated: %s",
+                 ", ".join(f"{u['key']}={u['value']}" for u in result["updated"]))
+    return result
+
+# ---------------------------------------------------------------------------
+# Compliance checklist - the compliance_requirement table
+# ---------------------------------------------------------------------------
+
+class ComplianceUpdate(BaseModel):
+    code: str
+    label: str | None = None
+    tier: str | None = None          # MANDATORY | ADVISORY
+    match_hint: str | None = None
+
+
+class ComplianceBulkUpdate(BaseModel):
+    updates: list[ComplianceUpdate]
+
+
+@router.put("/reference/compliance")
+def update_compliance(payload: ComplianceBulkUpdate, session: Session = Depends(get_session)):
+    """Add or edit compliance checklist items from the Policy in force screen.
+
+    Tier decides which gate a code drives: MANDATORY feeds Gate 1 (exclusion),
+    ADVISORY feeds the promotion rule's compliance condition - flattening the
+    two breaks the promotion rule. Extraction re-reads this table on every
+    document processed, so a tier flip or a brand-new code takes effect on
+    the next upload, not retroactively. The validation itself lives in
+    reference_actions, shared with the agent's own apply-and-rerun action.
+    """
+    result = reference_actions.apply_compliance_updates(
+        session, [u.model_dump() for u in payload.updates])
+    if result["updated"] or result["created"]:
+        log.info("compliance_requirement changed: updated=%s created=%s",
+                 [u["code"] for u in result["updated"]],
+                 [c["code"] for c in result["created"]])
+    return result
+
+
+@router.delete("/reference/compliance/{code}")
+def delete_compliance(code: str, session: Session = Depends(get_session)):
+    """Remove a compliance checklist item from the Policy in force screen.
+
+    A tombstone is written so seed.py's reconciliation loop never resurrects
+    one of the 7 seeded defaults on the next cold start. Editing or
+    re-adding the same code later, via PUT /reference/compliance, clears the
+    tombstone automatically.
+    """
+    result = reference_actions.remove_compliance(session, code)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    log.info("compliance_requirement deleted: %s", result["deleted"])
+    return result
 # ---------------------------------------------------------------------------
 # Reference data, shown in the dashboard so the policy in force is visible
 # ---------------------------------------------------------------------------
@@ -683,7 +934,8 @@ def get_reference(session: Session = Depends(get_session)):
             for a in session.scalars(select(ApprovedSupplier))
         ],
         "compliance_requirements": [
-            {"code": c.code, "label": c.label, "tier": c.tier}
+            {"code": c.code, "label": c.label, "tier": c.tier,
+             "manual_override": c.manual_override}
             for c in session.scalars(select(ComplianceRequirement))
         ],
         "policy": [

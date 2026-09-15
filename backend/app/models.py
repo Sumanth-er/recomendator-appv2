@@ -97,6 +97,11 @@ class ComplianceRequirement(Base):
     label: Mapped[str] = mapped_column(String(200))
     tier: Mapped[str] = mapped_column(String(16))  # MANDATORY | ADVISORY
     match_hint: Mapped[str | None] = mapped_column(Text)
+    # True once label/tier/match_hint have been set by hand (via the Policy
+    # in force screen) rather than by seed.py or a strategy upload. Without
+    # this, a manual edit to one of the 7 seeded codes would be silently
+    # reverted on the next cold start - see seed.py's reconciliation loop.
+    manual_override: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class PolicyConfig(Base):
@@ -337,6 +342,51 @@ class EvaluationRun(Base):
     result: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
+class ChatSession(Base):
+    """One agent conversation thread, scoped to a basket - not to a run.
+
+    Cloud Run's own memory can't hold this: the container can run several
+    instances at once and each starts empty, and today's agent already tears
+    down its InMemoryRunner at the end of every single call (see agent.py's
+    _ask) - there is no in-process continuity to lose. A basket is the right
+    scope rather than a single run, because a conversation like "what if the
+    ceiling were lower" naturally spans several runs of the same basket, and
+    a basket can have more than one open conversation at a time (two tabs,
+    two people).
+    """
+    __tablename__ = "chat_session"
+    session_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    comparison_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("comparison.comparison_id", ondelete="CASCADE"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    last_active_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ChatMessage(Base):
+    """One turn of a chat_session's transcript.
+
+    Read back and replayed into the prompt on every new question, since the
+    agent itself remembers nothing between calls - this table is the only
+    place continuity lives. resulting_run_id is set when this turn changed
+    policy and created a new run, so the UI can offer a direct link to the
+    new run without re-deriving it from the agent's prose.
+
+    `actions` records the simulate/apply tool calls the agent made in this
+    turn, with their exact arguments. The transcript alone only has the
+    agent's prose, and "yes, apply that" has to apply the change that was
+    actually simulated, not the agent's recollection of it.
+    """
+    __tablename__ = "chat_message"
+    message_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("chat_session.session_id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(16))  # user | agent
+    content: Mapped[str] = mapped_column(Text)
+    resulting_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("evaluation_run.run_id"), nullable=True)
+    actions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
 
 class RunNotes(Base):
     """Short written notes for one run's dashboard, drafted by the model.
@@ -367,3 +417,18 @@ class ApprovalPackage(Base):
     rendered_uri: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="DRAFT")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+class DeletedComplianceCode(Base):
+    """Tombstone for a compliance code intentionally removed via the UI.
+
+    seed.py's reconciliation only knows the 7 codes hard-coded in its
+    COMPLIANCE list; without this, deleting one of them would silently
+    reappear on the next Cloud Run cold start (its loop only checks "does
+    this code exist," not "was it deleted on purpose"). A custom code added
+    later isn't in that list at all, so deleting one needs no tombstone to
+    stay deleted - but one is written anyway, uniformly, as a small audit
+    trail of what was removed and when.
+    """
+    __tablename__ = "deleted_compliance_code"
+    code: Mapped[str] = mapped_column(String(64), primary_key=True)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
