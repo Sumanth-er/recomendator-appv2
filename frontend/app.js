@@ -156,22 +156,25 @@ const STATUS_PILL = {
   UPLOADED: "plain", PROCESSING: "info", READY: "ok", FAILED: "bad",
 };
 
+const DROPZONE = `
+  <p><strong>Drop quote PDFs here</strong> or <button class="link" id="pick">choose files</button></p>
+  <p class="small">Extraction, normalization and the automated checks run in the background.</p>
+  <input type="file" id="file" multiple accept="application/pdf" hidden>`;
+
+const DOCUMENTS_TABLE = `<div class="card scroll">
+  <table><thead><tr><th>File</th><th>Supplier</th><th>Status</th><th class="num">Pages</th><th></th></tr></thead>
+  <tbody id="document-rows"></tbody></table></div>`;
+
+/* The page is drawn once; the status poll then updates only what has actually
+ * changed. Re-rendering the whole view on every poll used to wipe whatever was
+ * open below it - opening a quote's extracted data while another document was
+ * still processing showed it for a second, then lost it - and rebuilding the
+ * table wholesale replaced the buttons under the pointer, so a click landing
+ * on a poll did nothing. Rows are now updated in place, and a row that has not
+ * changed is left alone. */
 async function comparison(id) {
   const data = await api(`/comparisons/${id}`);
-
-  const rows = data.documents.map((d) => `
-    <tr>
-      <td>${esc(d.filename)}${d.source_url ? ` <a class="small" href="${esc(d.source_url)}" target="_blank" rel="noopener">source</a>` : ""}</td>
-      <td>${esc(d.supplier_name || "-")}</td>
-      <td><span class="pill ${STATUS_PILL[d.status] || "plain"}">${esc(d.status.toLowerCase())}</span>
-          ${d.error_detail ? `<div class="small" style="color:var(--bad)">${esc(d.error_detail)}</div>` : ""}</td>
-      <td class="num">${d.page_count ?? "-"}</td>
-      <td class="num">
-        ${d.quote_id ? `<button class="link" data-quote="${esc(d.quote_id)}">extracted</button>` : ""}
-        <button class="link" data-reprocess="${esc(d.document_id)}">reprocess</button>
-        <button class="link" data-delete="${esc(d.document_id)}">remove</button>
-      </td>
-    </tr>`).join("");
+  let openQuoteId = null;
 
   view.innerHTML = `
     <div class="spread">
@@ -180,58 +183,150 @@ async function comparison(id) {
       <a href="#/" class="muted small">All comparisons</a>
     </div>
 
-    ${data.duplicate_suppliers.length ? `<div class="banner bad">
-      Two quotes from the same supplier are in this batch:
-      ${esc(data.duplicate_suppliers.join(", "))}. Every comparison assumes one quote
-      per supplier, so remove the older document before evaluating.</div>` : ""}
+    <div id="batch-alerts"></div>
 
     <div class="card">
-      <div class="dropzone" id="drop">
-        <p><strong>Drop quote PDFs here</strong> or <button class="link" id="pick">choose files</button></p>
-        <p class="small">Extraction, normalization and the automated checks run in the background.</p>
-        <input type="file" id="file" multiple accept="application/pdf" hidden>
-      </div>
+      <div class="dropzone" id="drop"></div>
     </div>
 
-    ${data.documents.length ? `<div class="card scroll">
-      <table><thead><tr><th>File</th><th>Supplier</th><th>Status</th><th class="num">Pages</th><th></th></tr></thead>
-      <tbody>${rows}</tbody></table></div>` : ""}
+    <div id="documents"></div>
 
     <div class="row">
-      <button class="primary" id="evaluate" ${data.can_evaluate ? "" : "disabled"}>Evaluate basket</button>
-      <span class="muted small">${data.can_evaluate
-        ? "All documents are ready."
-        : "Enabled once every document reaches ready and no supplier appears twice."}</span>
+      <button class="primary" id="evaluate">Evaluate basket</button>
+      <span class="muted small" id="evaluate-hint"></span>
     </div>
 
-    ${data.runs.length ? `<h2>Previous runs</h2><div class="card">
-      <table><thead><tr><th>Run</th><th>Created</th><th></th></tr></thead><tbody>
-      ${data.runs.map((r) => `<tr>
-        <td class="small">${esc(r.run_id.slice(0, 8))}</td>
-        <td class="muted small">${esc((r.created_at || "").slice(0, 16).replace("T", " "))}</td>
-        <td class="num"><a href="#/run/${esc(r.run_id)}">Open dashboard</a></td></tr>`).join("")}
-      </tbody></table></div>` : ""}
+    <div id="runs"></div>
 
     <div id="quote-detail"></div>`;
 
-  wireUpload(id);
+  const setHtml = (element, html) => {
+    if (element && element.innerHTML !== html) element.innerHTML = html;
+  };
 
-  view.querySelectorAll("[data-reprocess]").forEach((b) => {
-    b.onclick = async () => {
-      await api(`/documents/${b.dataset.reprocess}/reprocess`, { method: "POST" });
-      toast("Reprocessing");
-      route();
+  const documentCells = (d) => `
+    <td>${esc(d.filename)}${d.source_url ? ` <a class="small" href="${esc(d.source_url)}" target="_blank" rel="noopener">source</a>` : ""}</td>
+    <td>${esc(d.supplier_name || "-")}</td>
+    <td><span class="pill ${STATUS_PILL[d.status] || "plain"}">${esc(d.status.toLowerCase())}</span>
+        ${d.error_detail ? `<div class="small" style="color:var(--bad)">${esc(d.error_detail)}</div>` : ""}</td>
+    <td class="num">${d.page_count ?? "-"}</td>
+    <td class="num">
+      ${d.quote_id ? `<button class="link" data-quote="${esc(d.quote_id)}">extracted</button>` : ""}
+      <button class="link" data-reprocess="${esc(d.document_id)}">reprocess</button>
+      <button class="link" data-delete="${esc(d.document_id)}">remove</button>
+    </td>`;
+
+  function wireRow(row) {
+    const quote = row.querySelector("[data-quote]");
+    if (quote) {
+      quote.onclick = () => {
+        openQuoteId = quote.dataset.quote;
+        showExtracted(openQuoteId);
+      };
+    }
+    row.querySelector("[data-reprocess]").onclick = async (event) => {
+      event.target.disabled = true;
+      try {
+        await api(`/documents/${event.target.dataset.reprocess}/reprocess`, { method: "POST" });
+        toast("Reprocessing");
+      } catch (err) {
+        event.target.disabled = false;
+        toast(err.message);
+      }
+      refresh();
     };
-  });
-  view.querySelectorAll("[data-delete]").forEach((b) => {
-    b.onclick = async () => {
-      await api(`/documents/${b.dataset.delete}`, { method: "DELETE" });
-      route();
+    row.querySelector("[data-delete]").onclick = async (event) => {
+      event.target.disabled = true;
+      try {
+        await api(`/documents/${event.target.dataset.delete}`, { method: "DELETE" });
+      } catch (err) {
+        event.target.disabled = false;
+        toast(err.message);
+      }
+      refresh();
     };
-  });
-  view.querySelectorAll("[data-quote]").forEach((b) => {
-    b.onclick = () => showExtracted(b.dataset.quote);
-  });
+  }
+
+  function paintDocuments(documents) {
+    const container = document.getElementById("documents");
+    if (!documents.length) {
+      setHtml(container, "");
+      return;
+    }
+    if (!container.querySelector("#document-rows")) container.innerHTML = DOCUMENTS_TABLE;
+    const body = container.querySelector("#document-rows");
+
+    const seen = new Set();
+    for (const d of documents) {
+      seen.add(d.document_id);
+      const cells = documentCells(d);
+      let row = body.querySelector(`tr[data-document="${CSS.escape(d.document_id)}"]`);
+      if (!row) {
+        row = document.createElement("tr");
+        row.dataset.document = d.document_id;
+        body.appendChild(row);
+      } else if (row.dataset.cells === cells) {
+        continue;      // nothing about this document changed - leave it alone
+      }
+      row.innerHTML = cells;
+      row.dataset.cells = cells;
+      wireRow(row);
+    }
+    body.querySelectorAll("tr[data-document]").forEach((row) => {
+      if (!seen.has(row.dataset.document)) row.remove();
+    });
+  }
+
+  function paint(current) {
+    setHtml(document.getElementById("batch-alerts"),
+      current.duplicate_suppliers.length ? `<div class="banner bad">
+        Two quotes from the same supplier are in this batch:
+        ${esc(current.duplicate_suppliers.join(", "))}. Every comparison assumes one quote
+        per supplier, so remove the older document before evaluating.</div>` : "");
+
+    paintDocuments(current.documents);
+
+    const evaluate = document.getElementById("evaluate");
+    if (evaluate.textContent === "Evaluate basket") evaluate.disabled = !current.can_evaluate;
+    document.getElementById("evaluate-hint").textContent = current.can_evaluate
+      ? "All documents are ready."
+      : "Enabled once every document reaches ready and no supplier appears twice.";
+
+    setHtml(document.getElementById("runs"), current.runs.length
+      ? `<h2>Previous runs</h2><div class="card">
+         <table><thead><tr><th>Run</th><th>Created</th><th></th></tr></thead><tbody>
+         ${current.runs.map((r) => `<tr>
+           <td class="small">${esc(r.run_id.slice(0, 8))}</td>
+           <td class="muted small">${esc((r.created_at || "").slice(0, 16).replace("T", " "))}</td>
+           <td class="num"><a href="#/run/${esc(r.run_id)}">Open dashboard</a></td></tr>`).join("")}
+         </tbody></table></div>`
+      : "");
+
+    // The open panel belongs to a document that has since been removed.
+    if (openQuoteId && !current.documents.some((d) => d.quote_id === openQuoteId)) {
+      setHtml(document.getElementById("quote-detail"), "");
+      openQuoteId = null;
+    }
+
+    // Keep polling while anything is still being extracted.
+    clearTimeout(comparison.timer);
+    if (current.documents.some((d) => ["UPLOADED", "PROCESSING"].includes(d.status))) {
+      comparison.timer = setTimeout(refresh, 2500);
+    }
+  }
+
+  async function refresh() {
+    // Gone from the page: the user navigated away between polls.
+    if (!document.getElementById("documents")) return;
+    try {
+      paint(await api(`/comparisons/${id}`));
+    } catch {
+      // A blip on the poll is not worth blanking the page for; the next one
+      // tries again.
+      clearTimeout(comparison.timer);
+      comparison.timer = setTimeout(refresh, 5000);
+    }
+  }
 
   document.getElementById("evaluate").onclick = async (event) => {
     event.target.disabled = true;
@@ -241,29 +336,32 @@ async function comparison(id) {
       location.hash = `#/run/${created.run_id}`;
     } catch (err) {
       toast(err.message);
-      event.target.disabled = false;
       event.target.textContent = "Evaluate basket";
+      event.target.disabled = false;
     }
   };
 
-  // Poll while anything is still being extracted.
-  if (data.documents.some((d) => ["UPLOADED", "PROCESSING"].includes(d.status))) {
-    clearTimeout(comparison.timer);
-    comparison.timer = setTimeout(route, 2500);
-  }
+  wireUpload(id, refresh);
+  paint(data);
 }
 
-function wireUpload(id) {
+function wireUpload(id, refresh) {
   const drop = document.getElementById("drop");
+  drop.innerHTML = DROPZONE;
   const input = document.getElementById("file");
   document.getElementById("pick").onclick = () => input.click();
   input.onchange = () => send(input.files);
 
-  ["dragenter", "dragover"].forEach((e) =>
-    drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.add("hot"); }));
-  ["dragleave", "drop"].forEach((e) =>
-    drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove("hot"); }));
-  drop.addEventListener("drop", (ev) => send(ev.dataTransfer.files));
+  // On the element itself rather than its contents, so they survive the
+  // "uploading" message replacing what is inside it - and are added once.
+  if (!drop.dataset.wired) {
+    ["dragenter", "dragover"].forEach((e) =>
+      drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.add("hot"); }));
+    ["dragleave", "drop"].forEach((e) =>
+      drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove("hot"); }));
+    drop.addEventListener("drop", (ev) => send(ev.dataTransfer.files));
+    drop.dataset.wired = "1";
+  }
 
   async function send(files) {
     if (!files || !files.length) return;
@@ -275,10 +373,12 @@ function wireUpload(id) {
       if (result.duplicates_ignored.length) {
         toast(`Already in this comparison, ignored: ${result.duplicates_ignored.join(", ")}`);
       }
+      (result.rejected || []).forEach((r) => toast(`${r.filename}: ${r.reason}`));
     } catch (err) {
       toast(err.message);
     }
-    route();
+    wireUpload(id, refresh);   // puts the dropzone back
+    refresh();
   }
 }
 
@@ -765,6 +865,7 @@ async function run(runId) {
       </div>
     </div>
 
+    ${overridesBanner(data)}
     ${(k.unapproved_suppliers || []).length ? `<div class="banner bad">
       Not on the approved supplier list: ${esc(k.unapproved_suppliers.join(", "))}.</div>` : ""}
     ${(r.warnings || []).length ? `<div class="banner warn">
@@ -790,19 +891,19 @@ async function run(runId) {
     <h2>Sourcing agent</h2>
     <div class="card chat">
       <div class="spread">
-        <p class="chat-intro">Ask about this recommendation, explore a what-if, or tell
-        the agent to change a rule threshold, a ceiling price, a required volume or a
-        compliance requirement. A what-if is never saved. A change you ask for is saved
-        to the policy in force and the basket is re-evaluated into a new run; this run
-        stays as it is.</p>
+        <p class="chat-intro">Ask about this recommendation, or ask what a different
+        threshold, ceiling price, required volume or compliance tier would do. The agent
+        shows you the effect first and asks before creating anything; confirm, and it
+        evaluates the basket again into a new run under those values and opens it. The
+        policy in force never changes here — edit that on
+        <a href="#/reference">Policy in force</a>, which is what Evaluate basket uses.</p>
         <button class="link small nowrap" id="agent-reset" hidden>New conversation</button>
       </div>
-      <div id="agent-note"></div>
       <div id="agent-history"></div>
       <div class="chips" id="suggested"></div>
       <div class="ask-row">
         <input type="text" id="question" autocomplete="off"
-          placeholder="Ask, simulate or change - e.g. make SDS_LANGUAGE mandatory">
+          placeholder="Ask a question, or try a different value - e.g. what if SDS_LANGUAGE were mandatory?">
         <button class="primary" id="ask-btn">Send</button>
       </div>
     </div>
@@ -828,19 +929,12 @@ async function run(runId) {
   fillNotes(runId);          // prose arrives after the numbers; never blocks
 }
 
-/* One agent, one input. It explains the run, simulates what-ifs and applies
- * policy changes; the backend decides which, and says what it did:
- * new_run_id when a change was saved and the basket re-evaluated,
- * last_simulation - the exact arguments that would apply it - when the reply
- * is an unsaved what-if. The conversation belongs to the comparison, not to
- * this run, so it carries on across the runs the agent creates. */
-
-const CHANGE_LABELS = {
-  policy_changes: "threshold",
-  ceiling_price_changes: "ceiling price",
-  volume_changes: "required volume",
-  compliance_changes: "compliance",
-};
+/* One agent, one input. It explains the run, simulates what a different value
+ * would do, and - once you confirm in the conversation - evaluates the basket
+ * again into a new run under that value. It never edits the policy in force,
+ * so there is nothing to approve here: the reply carries new_run_id when a run
+ * was created, and this page follows it. The conversation belongs to the
+ * comparison, not to one run, so it carries across the runs it creates. */
 
 // localStorage can be unavailable (private windows, blocked storage). The chat
 // still works then; it just starts a fresh conversation on every visit.
@@ -850,13 +944,23 @@ const chatStore = {
   remove(key) { try { localStorage.removeItem(key); } catch { /* ignore */ } },
 };
 
+/* A run the agent made under different values says so, above the figures. */
+function overridesBanner(data) {
+  const summary = ((data.overrides || {}).summary) || [];
+  if (!summary.length) return "";
+  return `<div class="banner info">
+    <strong>Scenario run.</strong> Evaluated with values that apply to this run only —
+    the policy in force is unchanged, and Evaluate basket still uses it.
+    <ul>${summary.map((line) => `<li>${esc(line)}</li>`).join("")}</ul>
+  </div>`;
+}
+
 function wireAgent(runId, data) {
   const r = data.result;
   const comparisonId = data.comparison_id;
   const sessionKey = `chat-session:${comparisonId}`;
   const $ = (id) => document.getElementById(id);
   const historyEl = $("agent-history");
-  let currentRunId = runId;   // moves on when the agent creates a newer run
   let busy = false;
 
   const primary = r.suppliers.find((s) => s.final_rank === 1);
@@ -887,39 +991,20 @@ function wireAgent(runId, data) {
     suggestions.map((q) => `<button class="chip" data-q="${esc(q)}">${esc(q)}</button>`).join("");
 
   const newRunBanner = (newRunId) => `
-    <div class="banner ok agent-banner">Saved. The basket was re-evaluated into a new run.
-      <a href="#/run/${esc(newRunId)}">Open the updated dashboard</a></div>`;
+    <div class="banner ok agent-banner">A new run was created for that.
+      <a href="#/run/${esc(newRunId)}">Open it</a></div>`;
 
-  // Once the agent has created a newer run, questions go to that run - but
-  // this page still shows the old one, which has to be said.
-  function followRun(newRunId) {
-    currentRunId = newRunId;
-    $("agent-note").innerHTML = newRunId === runId ? "" : `
-      <div class="banner warn agent-banner">The conversation has moved on to run
-        ${esc(newRunId.slice(0, 8))}; this page still shows run ${esc(runId.slice(0, 8))}.
-        <a href="#/run/${esc(newRunId)}">Open the new run</a></div>`;
+  const atBottom = () =>
+    historyEl.scrollHeight - historyEl.scrollTop - historyEl.clientHeight < 60;
+
+  function scrollToLatest() {
+    historyEl.scrollTop = historyEl.scrollHeight;
   }
 
-  function describeChanges(args) {
-    return Object.entries(CHANGE_LABELS)
-      .flatMap(([field, label]) => (args[field] || []).map((c) => `${label} ${c}`))
-      .join(", ");
-  }
-
-  function renderReply(block, answer, newRunId, simulation) {
+  function renderReply(block, answer, newRunId) {
     block.querySelector(".qa-thinking")?.remove();
     block.insertAdjacentHTML("beforeend", `<div class="answer">${markdown(answer)}</div>`);
-    if (newRunId) {
-      block.insertAdjacentHTML("beforeend", newRunBanner(newRunId));
-    } else if (simulation && describeChanges(simulation)) {
-      block.insertAdjacentHTML("beforeend", `
-        <div class="apply-row">
-          <button class="apply-btn">Apply this change</button>
-          <span class="apply-args">${esc(describeChanges(simulation))}</span>
-        </div>`);
-      const button = block.querySelector(".apply-btn");
-      button.onclick = () => applySimulation(button, simulation);
-    }
+    if (newRunId) block.insertAdjacentHTML("beforeend", newRunBanner(newRunId));
   }
 
   async function ensureSession() {
@@ -931,42 +1016,18 @@ function wireAgent(runId, data) {
     return created.session_id;
   }
 
-  async function applySimulation(button, simulation) {
-    if (busy) return;
-    busy = true;
-    button.disabled = true;
-    button.textContent = "Applying…";
-    try {
-      const sessionId = await ensureSession();
-      const result = await api("/reference/apply-and-rerun", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ comparison_id: comparisonId, session_id: sessionId, ...simulation }),
-      });
-      button.closest(".apply-row").outerHTML = newRunBanner(result.run_id);
-      followRun(result.run_id);
-      toast("Change saved and a new evaluation run created");
-    } catch (err) {
-      button.disabled = false;
-      button.textContent = "Apply this change";
-      toast(err.message);
-    } finally {
-      busy = false;
-    }
-  }
-
   async function loadHistory() {
     const sessionId = chatStore.get(sessionKey);
     if (!sessionId) return;
-    let data;
+    let history;
     try {
-      data = await api(`/chat/sessions/${sessionId}/messages`);
+      history = await api(`/chat/sessions/${sessionId}/messages`);
     } catch {
       chatStore.remove(sessionKey);   // the session is gone; start a new one on ask
       return;
     }
     let block = null;
-    for (const m of data.messages) {
+    for (const m of history.messages) {
       if (m.role === "user" || !block) {
         block = document.createElement("div");
         block.className = "qa";
@@ -975,18 +1036,11 @@ function wireAgent(runId, data) {
       if (m.role === "user") {
         block.innerHTML = `<p class="qa-q">${esc(m.content)}</p>`;
       } else {
-        renderReply(block, m.content, m.resulting_run_id, null);
+        renderReply(block, m.content, m.resulting_run_id);
       }
     }
-    $("agent-reset").hidden = !data.messages.length;
-  }
-
-  async function send(sessionId, question) {
-    return api(`/chat/sessions/${sessionId}/ask?run_id=${encodeURIComponent(currentRunId)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
-    });
+    $("agent-reset").hidden = !history.messages.length;
+    scrollToLatest();
   }
 
   async function ask(text) {
@@ -1006,24 +1060,39 @@ function wireAgent(runId, data) {
     block.innerHTML = `<p class="qa-q">${esc(question)}</p>
       <p class="qa-thinking">Working on it<span class="dots"></span></p>`;
     historyEl.appendChild(block);
-    block.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    scrollToLatest();
 
     try {
+      const send = async () => api(
+        `/chat/sessions/${await ensureSession()}/ask?run_id=${encodeURIComponent(runId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question }),
+        });
       let response;
       try {
-        response = await send(await ensureSession(), question);
+        response = await send();
       } catch (err) {
         // A session removed on the server (the comparison was deleted and
         // recreated, the database was reset): start a new one and resend.
         if (!/chat session not found/i.test(err.message)) throw err;
         chatStore.remove(sessionKey);
-        response = await send(await ensureSession(), question);
+        response = await send();
       }
-      renderReply(block, response.answer, response.new_run_id, response.last_simulation);
-      if (response.new_run_id) followRun(response.new_run_id);
+      const follow = atBottom();
+      renderReply(block, response.answer, response.new_run_id);
+      if (follow) scrollToLatest();
+      if (response.new_run_id) {
+        // Confirmed in the conversation, so go straight to the run it made.
+        // The transcript is stored, so the answer is there when it opens.
+        toast("New run created — opening it");
+        setTimeout(() => { location.hash = `#/run/${response.new_run_id}`; }, 900);
+      }
     } catch (err) {
       block.querySelector(".qa-thinking")?.remove();
       block.insertAdjacentHTML("beforeend", `<div class="banner bad">${esc(err.message)}</div>`);
+      scrollToLatest();
     } finally {
       busy = false;
       $("ask-btn").disabled = false;
@@ -1042,7 +1111,6 @@ function wireAgent(runId, data) {
     chatStore.remove(sessionKey);
     historyEl.innerHTML = "";
     $("agent-reset").hidden = true;
-    followRun(runId);
   };
 
   const historyReady = loadHistory();

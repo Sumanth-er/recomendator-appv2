@@ -11,10 +11,12 @@ Two shapes of input arrive here:
 * The Policy in force screen sends structured rows ({"key", "value"} and
   {"code", "label", "tier"}) - apply_policy_updates, apply_compliance_updates,
   remove_compliance.
-* The agent and the chat's "Apply this change" button send a ChangeSet in
-  "KEY=VALUE" form - parse_changes, then apply_change_set. The same parsed
-  ChangeSet is what evaluation.simulate() overrides with, so a simulated
-  change and an applied one can never be read two different ways.
+* The agent sends a ChangeSet in "KEY=VALUE" form - parse_changes. That set
+  is never written anywhere: evaluation.simulate() and run_evaluation() lay it
+  over the reference data for one evaluation, so what the agent explores
+  belongs to its run alone and the policy in force stays where the buyer put
+  it. Both read it the same way, so a simulated change and the run made from
+  it cannot drift apart.
 """
 from __future__ import annotations
 
@@ -185,7 +187,8 @@ def remove_compliance(session: Session, code: str) -> dict:
 
 @dataclass
 class ChangeSet:
-    """A validated set of changes, resolved to absolute values.
+    """A validated set of changes for one evaluation run, resolved to absolute
+    values. Nothing here is ever saved as policy.
 
     policy: policy_config key -> value. ceilings / volumes: CAS -> EUR/L or
     litres. compliance: code -> MANDATORY, ADVISORY or REMOVED. `details`
@@ -204,10 +207,9 @@ class ChangeSet:
     def as_arguments(self) -> dict[str, list[str]]:
         """The same changes in absolute KEY=VALUE form.
 
-        Relative entries ("+2", "-10%") are resolved against the value in
-        force when they were parsed. Replaying the resolved form - which is
-        what the chat's Apply button does after a simulation - applies exactly
-        what was simulated, even if the value moved in between.
+        Relative entries ("+2", "-10%") are already resolved, so replaying
+        this form re-runs exactly what was simulated. It is what a run stores
+        as its overrides and what the next turn builds on.
         """
         return {
             "policy_changes": [f"{k}={_plain(v)}" for k, v in self.policy.items()],
@@ -223,8 +225,13 @@ def _plain(value: Decimal) -> str:
 
 _NUMBER = re.compile(
     r"(?P<sign>[+-])?\s*(?P<digits>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d*\.?\d+)\s*(?P<pct>%)?")
+# A unit the model echoed back with the value. "percentage points" is a unit;
+# "percent" on a signed value means a proportion of the current value, which is
+# the same thing "%" means - "-10 percent" and "-10%" must not diverge.
 _UNIT_SUFFIX = re.compile(
-    r"\s*(?:eur\s*/\s*l(?:itre|iter)?|eur|€|litres?|liters?|l)\s*$", re.IGNORECASE)
+    r"\s*(?P<unit>percentage\s*points?|percent(?:age)?|pct|points?|pts?|pp"
+    r"|eur\s*/\s*l(?:itre|iter)?|eur|€|litres?|liters?|l)\s*$", re.IGNORECASE)
+_CAS = re.compile(r"\d{2,7}-\d{2}-\d")
 
 
 def _entries(value) -> list:
@@ -265,8 +272,15 @@ def _number(raw: str, current: Decimal | None, label: str,
     the database would store - otherwise Postgres rounds the applied value
     and it no longer matches what was simulated.
     """
-    text = _UNIT_SUFFIX.sub("", raw.strip())
-    match = _NUMBER.fullmatch(text)
+    text = raw.strip()
+    proportion = False
+    unit = _UNIT_SUFFIX.search(text)
+    if unit:
+        word = unit["unit"].lower()
+        proportion = word.startswith(("percent", "pct")) and "point" not in word
+        text = text[:unit.start()]
+
+    match = _NUMBER.fullmatch(text.strip())
     if not match:
         errors.append(f"{label}: {raw!r} is not a number (use a dot for decimals)")
         return None
@@ -275,21 +289,42 @@ def _number(raw: str, current: Decimal | None, label: str,
         if current is None:
             errors.append(f"{label}: there is no current value to change relative to")
             return None
-        delta = current * amount / Decimal("100") if match["pct"] else amount
+        delta = (current * amount / Decimal("100")
+                 if (match["pct"] or proportion) else amount)
         amount = current + delta if match["sign"] == "+" else current - delta
     return amount.quantize(Decimal(1).scaleb(-scale))
 
 
+def _policy_key(raw: str) -> str:
+    """policy_config keys are snake_case; a model may space or hyphenate them."""
+    return re.sub(r"[\s\-]+", "_", raw.strip().lower()).strip("_")
+
+
 def _material_key(session: Session, raw: str) -> str | None:
-    """A CAS number as given, or resolved from the material's catalogue name."""
+    """A CAS number, or the material resolved from what the model wrote.
+
+    Takes a CAS number out of something like "CAS 7664-93-9", and accepts a
+    catalogue name, exact or as an unambiguous part of one ("sulfuric acid" for
+    "Sulfuric Acid 98%"). A part that matches two materials resolves to nothing
+    rather than to the first of them.
+    """
     key = raw.strip()
     if session.get(Material, key):
         return key
-    wanted = key.lower()
-    for material in session.scalars(select(Material)):
+
+    inside = _CAS.search(key)
+    if inside and session.get(Material, inside.group(0)):
+        return inside.group(0)
+
+    wanted = re.sub(r"\s+", " ", key.lower()).strip()
+    if not wanted:
+        return None
+    materials = list(session.scalars(select(Material)))
+    for material in materials:
         if material.name.lower() == wanted:
             return material.cas_no
-    return None
+    partial = [m.cas_no for m in materials if wanted in m.name.lower()]
+    return partial[0] if len(partial) == 1 else None
 
 
 def parse_changes(
@@ -298,27 +333,49 @@ def parse_changes(
     ceiling_price_changes: list[str] | None = None,
     volume_changes: list[str] | None = None,
     compliance_changes: list[str] | None = None,
+    base: ChangeSet | None = None,
 ) -> tuple[ChangeSet, list[str]]:
-    """Validate every entry against what is in force now.
+    """Validate every entry and return the ChangeSet a run can be evaluated with.
 
-    Returns the ChangeSet and a list of errors. Callers apply nothing unless
-    the error list is empty: half of a requested change is a policy nobody
-    asked for.
+    `base` is the set of changes the run being worked from already carries.
+    Entries are laid over it, and a relative change resolves against the value
+    that run actually used: asking for "2 points more" on a run already at 15
+    gives 17, not 7. The returned ChangeSet is the whole effective set - base
+    included - because that is what the next run has to be evaluated with;
+    `details` covers only what this call changed, which is what gets reported.
+
+    Nothing here writes. These changes belong to one evaluation run; the
+    policy in force is only ever edited from the Policy in force screen.
+
+    Callers evaluate nothing unless the error list is empty: half of a
+    requested change is a scenario nobody asked for.
     """
-    changes = ChangeSet()
+    changes = ChangeSet(
+        policy=dict(base.policy) if base else {},
+        ceilings=dict(base.ceilings) if base else {},
+        volumes=dict(base.volumes) if base else {},
+        compliance=dict(base.compliance) if base else {},
+    )
     errors: list[str] = []
+
+    def _detail(detail: dict, in_force) -> dict:
+        """Mark when this run was already overriding the policy in force."""
+        if in_force is not None and str(in_force) != str(detail["previous"]):
+            detail["policy_in_force"] = str(in_force)
+        return detail
 
     for entry in _entries(policy_changes):
         parts = _split(entry, errors)
         if not parts:
             continue
-        key = parts[0].lower()
+        key = _policy_key(parts[0])
         row = session.get(PolicyConfig, key)
         if not row:
             known = ", ".join(sorted(r.key for r in session.scalars(select(PolicyConfig))))
             errors.append(f"unknown policy key {key!r}; valid keys: {known}")
             continue
-        current = Decimal(str(row.value))
+        in_force = Decimal(str(row.value))
+        current = changes.policy.get(key, in_force)
         value = _number(parts[1], current, key, errors, scale=6)   # Numeric(16, 6)
         if value is None:
             continue
@@ -327,12 +384,12 @@ def parse_changes(
             errors.append(f"{key}: {_plain(value)} {problem}")
             continue
         changes.policy[key] = value
-        changes.details.append({
+        changes.details.append(_detail({
             "kind": "policy threshold", "key": key, "unit": row.unit,
             "previous": _plain(current), "new": _plain(value),
             "affects_evaluation": key not in NOT_USED_BY_ENGINE,
             **({"note": NOT_USED_BY_ENGINE[key]} if key in NOT_USED_BY_ENGINE else {}),
-        })
+        }, _plain(in_force)))
 
     for entry in _entries(ceiling_price_changes):
         parts = _split(entry, errors)
@@ -344,7 +401,8 @@ def parse_changes(
                           "get_current_materials")
             continue
         row = session.get(Benchmark, cas)
-        current = Decimal(str(row.ceiling_price_eur_l)) if row else None
+        in_force = Decimal(str(row.ceiling_price_eur_l)) if row else None
+        current = changes.ceilings.get(cas, in_force)
         value = _number(parts[1], current, f"ceiling price for {cas}", errors,
                         scale=6)   # Numeric(14, 6)
         if value is None:
@@ -355,12 +413,12 @@ def parse_changes(
                           f"{lo} and at most {hi} EUR/L")
             continue
         changes.ceilings[cas] = value
-        changes.details.append({
+        changes.details.append(_detail({
             "kind": "ceiling price", "key": cas,
             "material": session.get(Material, cas).name, "unit": "EUR/L",
             "previous": _plain(current) if current is not None else None,
             "new": _plain(value), "affects_evaluation": True,
-        })
+        }, _plain(in_force) if in_force is not None else None))
 
     for entry in _entries(volume_changes):
         parts = _split(entry, errors)
@@ -372,7 +430,8 @@ def parse_changes(
             errors.append(f"{parts[0]!r} is not in the demand basket; only the "
                           "required volume of a basket material can change")
             continue
-        current = Decimal(str(row.required_qty_l))
+        in_force = Decimal(str(row.required_qty_l))
+        current = changes.volumes.get(cas, in_force)
         value = _number(parts[1], current, f"required volume for {cas}", errors,
                         scale=4)   # Numeric(16, 4)
         if value is None:
@@ -383,12 +442,12 @@ def parse_changes(
                           f"{lo} and at most {hi} L")
             continue
         changes.volumes[cas] = value
-        changes.details.append({
+        changes.details.append(_detail({
             "kind": "required volume", "key": cas,
             "material": session.get(Material, cas).name, "unit": "L",
             "previous": _plain(current), "new": _plain(value),
             "affects_evaluation": True,
-        })
+        }, _plain(in_force)))
 
     for entry in _entries(compliance_changes):
         parts = _split(entry, errors)
@@ -401,48 +460,57 @@ def parse_changes(
                 r.code for r in session.scalars(select(ComplianceRequirement))))
             errors.append(
                 f"{code!r} is not on the compliance checklist (current codes: {known}). "
-                "Adding a new requirement needs a label and is a separate action.")
+                "A new requirement is added on the Policy in force screen, because "
+                "quotes have to be re-read against it before it can be evaluated.")
             continue
         tier = TIER_ALIASES.get(parts[1].strip().upper())
         if not tier:
             errors.append(f"{code}: tier must be MANDATORY, ADVISORY or REMOVED, "
                           f"not {parts[1]!r}")
             continue
+        current_tier = changes.compliance.get(code, row.tier)
         changes.compliance[code] = tier
-        changes.details.append({
+        changes.details.append(_detail({
             "kind": "compliance requirement", "key": code, "label": row.label,
-            "previous": row.tier, "new": tier, "affects_evaluation": True,
-        })
+            "previous": current_tier, "new": tier, "affects_evaluation": True,
+        }, row.tier))
 
     return changes, errors
 
 
-def apply_change_set(session: Session, changes: ChangeSet) -> list[dict]:
-    """Write a validated ChangeSet in one commit. Returns its details."""
+def describe_overrides(session: Session, changes: ChangeSet) -> list[str]:
+    """One line per change, against the policy in force - for the dashboard.
+
+    Written when the run is created rather than read back later, so the run
+    keeps saying what it was a scenario of even after the policy moves on.
+    """
+    lines: list[str] = []
+
     for key, value in changes.policy.items():
-        session.get(PolicyConfig, key).value = value
+        row = session.get(PolicyConfig, key)
+        unit = f" {row.unit}" if row and row.unit else ""
+        in_force = f" (policy in force: {_plain(Decimal(str(row.value)))}{unit})" if row else ""
+        lines.append(f"{key} = {_plain(value)}{unit}{in_force}")
 
     for cas, value in changes.ceilings.items():
+        material = session.get(Material, cas)
         row = session.get(Benchmark, cas)
-        if row:
-            row.ceiling_price_eur_l = value
-        else:
-            session.add(Benchmark(cas_no=cas, ceiling_price_eur_l=value))
+        in_force = (f" (policy in force: {_plain(Decimal(str(row.ceiling_price_eur_l)))} EUR/L)"
+                    if row else "")
+        lines.append(f"ceiling price, {material.name if material else cas} = "
+                     f"{_plain(value)} EUR/L{in_force}")
 
     for cas, value in changes.volumes.items():
-        session.get(Demand, cas).required_qty_l = value
+        material = session.get(Material, cas)
+        row = session.get(Demand, cas)
+        in_force = (f" (policy in force: {_plain(Decimal(str(row.required_qty_l)))} L)"
+                    if row else "")
+        lines.append(f"required volume, {material.name if material else cas} = "
+                     f"{_plain(value)} L{in_force}")
 
     for code, tier in changes.compliance.items():
         row = session.get(ComplianceRequirement, code)
-        if tier == REMOVED:
-            session.delete(row)
-            if not session.get(DeletedComplianceCode, code):
-                session.add(DeletedComplianceCode(code=code))
-        else:
-            row.tier = tier
-            # Same protection a manual edit on the Policy in force screen
-            # gets: seed.py stops reconciling this code back to its default.
-            row.manual_override = True
+        in_force = f" (policy in force: {row.tier})" if row else ""
+        lines.append(f"{code} = {tier}{in_force}")
 
-    session.commit()
-    return changes.details
+    return lines

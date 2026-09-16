@@ -64,6 +64,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_column("compliance_requirement", "manual_override", "BOOLEAN", "FALSE")
     _ensure_column("chat_message", "actions", "JSON", "NULL")
+    _ensure_column("evaluation_run", "overrides", "JSON", "NULL")
     created = inspect(engine).get_table_names()
     log.info("schema ready, %d tables present", len(created))
 

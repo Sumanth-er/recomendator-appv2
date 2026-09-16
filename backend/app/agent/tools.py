@@ -9,13 +9,17 @@ Three groups, and the agent's instruction says which one a request needs:
   neither would be trustworthy.
 * simulate_what_if - the real engine on the real quotes under hypothetical
   policy, with nothing saved.
-* apply_changes, add_compliance_requirement, rerun_evaluation - the buyer
-  asked for policy to change, so it changes and a new immutable run records
-  the result. Past runs are never touched.
+* rerun_with_changes and rerun_evaluation - the buyer confirmed they want a
+  run made, so the basket is evaluated into a new immutable run. Past runs are
+  never touched.
 
-simulate_what_if and apply_changes take the same arguments, parsed by the same
-reference_action.parse_changes, so what was simulated is exactly what gets
-applied. Before-and-after comparisons are worked out here in Python; the
+Nothing here writes policy. A threshold, ceiling price, required volume or
+compliance tier the agent uses applies to the run it creates and to nothing
+else; the Policy in force screen remains the only way the real policy changes,
+and the Evaluate basket button always evaluates that policy. simulate_what_if
+and rerun_with_changes take the same arguments, parsed by the same
+reference_action.parse_changes, so what was simulated is exactly what the run
+is made from. Before-and-after comparisons are worked out here in Python; the
 agent reports them and does no arithmetic of its own.
 """
 from __future__ import annotations
@@ -33,10 +37,10 @@ from ..models import EvaluationRun
 class TurnLog:
     """What the agent did during one request, beyond reading.
 
-    The HTTP layer needs this to link the new run and to offer "Apply this
-    change" under a simulation, and it has to survive the agent timing out
-    after a change was already saved - which is why it is recorded as the
-    tools run rather than read back from the model's reply.
+    The HTTP layer needs this to send the browser to a run the turn created,
+    and it has to survive the agent timing out after the run was already
+    made - which is why it is recorded as the tools run rather than read back
+    from the model's reply.
     """
     actions: list[dict] = field(default_factory=list)
     new_run_ids: list[str] = field(default_factory=list)
@@ -81,7 +85,8 @@ def _run(run_id: str) -> dict:
 
 
 def get_run_summary(run_id: str) -> dict:
-    """Headline figures and the final ranking for one evaluation run.
+    """Headline figures and the final ranking for one evaluation run, and
+    whether this run is the policy in force or a scenario with changed values.
 
     Args:
         run_id: identifier of the evaluation run.
@@ -89,7 +94,9 @@ def get_run_summary(run_id: str) -> dict:
     result = _run(run_id)
     if not result:
         return {"error": "no such run"}
+    row = _run_row(run_id) or {}
     return {
+        "evaluated_with": (row.get("overrides") or {}).get("summary") or "the policy in force",
         "kpis": result.get("kpis", {}),
         "ceiling_equivalent_total_eur": result.get("ceiling_equivalent_total_eur"),
         "suppliers": [
@@ -433,13 +440,43 @@ def _same_outcome(a: dict, b: dict) -> bool:
 
 
 SCOPE_NOTE = (
-    "Policy is shared: this applies to every future evaluation, in every "
-    "comparison. Runs already created keep the policy they were evaluated with."
+    "This belongs to this evaluation run only. The policy in force - the "
+    "thresholds, ceiling prices, required volumes and compliance tiers on the "
+    "Policy in force screen - is not changed by it, and pressing Evaluate "
+    "basket still evaluates the policy in force."
 )
 
 
+def _run_row(run_id: str):
+    with SessionLocal() as session:
+        run = session.get(EvaluationRun, run_id)
+        if not run:
+            return None
+        return {"comparison_id": run.comparison_id, "result": run.result or {},
+                "overrides": run.overrides or {}}
+
+
+def _base_changes(session, run_id: str):
+    """The changes the run being worked from already carries.
+
+    Re-parsed rather than trusted, so a stored override that no longer makes
+    sense - a checklist code since removed on the Policy in force screen -
+    surfaces as an error instead of being evaluated as if it were still there.
+    """
+    from ..reference_action import parse_changes
+
+    run = session.get(EvaluationRun, run_id)
+    arguments = ((run.overrides or {}).get("arguments") or {}) if run else {}
+    if not arguments:
+        return None, []
+    return parse_changes(
+        session,
+        arguments.get("policy_changes"), arguments.get("ceiling_price_changes"),
+        arguments.get("volume_changes"), arguments.get("compliance_changes"))
+
+
 # ---------------------------------------------------------------------------
-# What if - nothing saved
+# What if - nothing saved, not even a run
 # ---------------------------------------------------------------------------
 
 def simulate_what_if(
@@ -450,28 +487,31 @@ def simulate_what_if(
     compliance_changes: list[str] = [],
 ) -> dict:
     """Re-run the real engine on this basket's real quotes with hypothetical
-    changes, WITHOUT saving anything, and compare the outcome with the policy
-    in force today.
+    changes and compare the outcome with this run, WITHOUT saving anything.
 
     Use this for any "what if", "would", "suppose" or "what happens if"
-    question. Never hand-compute the answer - report what this returns.
+    question, and to show a buyer what a change would do before they confirm
+    creating a run for it. Never hand-compute the answer - report what this
+    returns.
 
-    Every change is a "KEY=VALUE" string. A bare number is the new value; a
-    leading + or - is relative to the current value ("+2" adds 2 in the
-    value's own unit, "-10%" takes off ten percent of the current value).
+    Changes are laid over what this run already uses, so on a run that is
+    itself a scenario they stack rather than replace. Every change is a
+    "KEY=VALUE" string. A bare number is the new value; a leading + or - is
+    relative to this run's current value ("+2" adds 2 in the value's own unit,
+    "-10%" takes off ten percent of it).
 
     Args:
-        run_id: an evaluation run in the basket to simulate.
+        run_id: the evaluation run to simulate against.
         policy_changes: rule thresholds, keys from get_current_policy, e.g.
-            ["ceiling_materiality_pct=10"].
+            ["ceiling_materiality_pct=15"].
         ceiling_price_changes: a material's ceiling price in EUR per litre,
             keyed by CAS number from get_current_materials, e.g.
             ["7664-93-9=0.90"].
         volume_changes: a material's required volume in litres, keyed by CAS
             number, e.g. ["7664-93-9=40000"].
-        compliance_changes: an existing checklist code's new tier - MANDATORY,
-            ADVISORY or REMOVED - codes from get_current_compliance, e.g.
-            ["SDS_LANGUAGE=MANDATORY"].
+        compliance_changes: an existing checklist code's tier for this run -
+            MANDATORY, ADVISORY or REMOVED - codes from
+            get_current_compliance, e.g. ["SDS_LANGUAGE=MANDATORY"].
     """
     from ..evaluation import EvaluationError, simulate
     from ..reference_action import parse_changes
@@ -481,16 +521,23 @@ def simulate_what_if(
         if not run:
             return {"error": f"no evaluation run with id {run_id}"}
 
+        base, base_errors = _base_changes(session, run_id)
+        if base_errors:
+            return {"simulation": True, "saved": False, "errors": [
+                "this run's own changes can no longer be evaluated: "
+                + "; ".join(base_errors)
+                + ". A plain re-run starts again from the policy in force."]}
+
         changes, errors = parse_changes(
             session, policy_changes, ceiling_price_changes, volume_changes,
-            compliance_changes)
-        if not errors and changes.is_empty():
+            compliance_changes, base=base)
+        if not errors and not changes.details:
             errors = ["no changes were given"]
         if errors:
             return {"simulation": True, "saved": False, "errors": errors}
 
         try:
-            baseline = simulate(session, run.comparison_id)
+            baseline = simulate(session, run.comparison_id, base)
             simulated = simulate(session, run.comparison_id, changes)
         except EvaluationError as exc:
             return {"simulation": True, "saved": False, "errors": [str(exc)]}
@@ -505,42 +552,43 @@ def simulate_what_if(
             "simulation": True,
             "saved": False,
             "changes": changes.details,
-            "compared_with": "this basket evaluated under the policy in force today",
-            "policy_in_force_matches_this_run": _same_outcome(run.result or {}, baseline),
+            "this_run_uses": (run.overrides or {}).get("summary") or "the policy in force",
+            "compared_with": "this basket evaluated the way this run was",
+            "run_still_reproduces": _same_outcome(run.result or {}, baseline),
             "outcome": compare_outcomes(baseline, simulated),
-            "to_apply_call_apply_changes_with": arguments,
+            "scope": SCOPE_NOTE,
         }
 
 
 # ---------------------------------------------------------------------------
-# Changes the buyer asked for - saved, and evaluated into a new run
+# A new run under different values - saved as a run, never as policy
 # ---------------------------------------------------------------------------
 
-def apply_changes(
+def rerun_with_changes(
     run_id: str,
     policy_changes: list[str] = [],
     ceiling_price_changes: list[str] = [],
     volume_changes: list[str] = [],
     compliance_changes: list[str] = [],
 ) -> dict:
-    """SAVE changes to the policy in force, then re-evaluate this basket into
-    a new evaluation run and compare it with run_id.
+    """Evaluate this basket into a NEW run under changed values, and compare it
+    with run_id. The changes belong to the new run; the policy in force is not
+    touched, and the Evaluate basket button still uses the policy in force.
 
-    Only call this when the buyer has asked for the change to be made, not
-    when they are asking what would happen. Arguments are exactly those of
-    simulate_what_if. Every change is validated first; if any one is invalid
-    nothing at all is saved.
+    Call this only after the buyer has confirmed they want the run created -
+    simulate first and ask. Arguments are exactly those of simulate_what_if,
+    and are laid over what run_id already uses. Every change is validated
+    first; if any one is invalid, no run is created.
 
     Args:
-        run_id: the evaluation run the buyer is looking at; its basket is
-            re-evaluated.
-        policy_changes: e.g. ["ceiling_materiality_pct=10"].
+        run_id: the run whose basket and current values this builds on.
+        policy_changes: e.g. ["ceiling_materiality_pct=15"].
         ceiling_price_changes: e.g. ["7664-93-9=0.90"].
         volume_changes: e.g. ["7664-93-9=40000"].
         compliance_changes: e.g. ["SDS_LANGUAGE=MANDATORY"] or
             ["TSCA=REMOVED"].
     """
-    from ..evaluation import EvaluationError, apply_changes_and_evaluate
+    from ..evaluation import EvaluationError, run_evaluation
     from ..reference_action import parse_changes
 
     with SessionLocal() as session:
@@ -548,90 +596,48 @@ def apply_changes(
         if not run:
             return {"error": f"no evaluation run with id {run_id}"}
 
+        base, base_errors = _base_changes(session, run_id)
+        if base_errors:
+            return {"created": False, "errors": [
+                "this run's own changes can no longer be evaluated: "
+                + "; ".join(base_errors)
+                + ". A plain re-run starts again from the policy in force."]}
+
         changes, errors = parse_changes(
             session, policy_changes, ceiling_price_changes, volume_changes,
-            compliance_changes)
-        if not errors and changes.is_empty():
+            compliance_changes, base=base)
+        if not errors and not changes.details:
             errors = ["no changes were given"]
         if errors:
-            return {"applied": False, "saved": False, "errors": errors}
+            return {"created": False, "errors": errors}
 
+        before = run.result or {}
         try:
-            new_run = apply_changes_and_evaluate(session, run.comparison_id, changes)
+            new_run = run_evaluation(session, run.comparison_id, changes)
         except EvaluationError as exc:
             session.rollback()
-            return {"applied": False, "saved": False, "errors": [str(exc)]}
+            return {"created": False, "errors": [str(exc)]}
 
-        _record(tool="apply_changes", run_id=run_id,
+        _record(tool="rerun_with_changes", run_id=run_id,
                 arguments=changes.as_arguments(), changes=changes.details,
                 new_run_id=new_run.run_id)
         return {
-            "applied": True,
-            "saved": True,
+            "created": True,
+            "policy_in_force_changed": False,
             "new_run_id": new_run.run_id,
             "previous_run_id": run_id,
             "changes": changes.details,
+            "new_run_uses": (new_run.overrides or {}).get("summary") or [],
             "scope": SCOPE_NOTE,
-            "outcome": compare_outcomes(run.result or {}, new_run.result or {}),
+            "outcome": compare_outcomes(before, new_run.result or {}),
         }
 
 
-def add_compliance_requirement(code: str, label: str, tier: str,
-                               match_hint: str = "") -> dict:
-    """SAVE a brand-new requirement to the compliance checklist.
-
-    Only for a code that is not on the checklist yet - changing an existing
-    code's tier, or removing it, is apply_changes with compliance_changes.
-    Quotes already extracted were never checked against a new requirement, so
-    this does not create a new evaluation run; see the note it returns.
-
-    Args:
-        code: short identifier, e.g. "ROHS". Normalized to upper case.
-        label: what the requirement is, in words extraction can look for,
-            e.g. "RoHS compliance declaration".
-        tier: MANDATORY (Gate 1 exclusion) or ADVISORY (promotion rule).
-        match_hint: optional comma-separated phrases a quote might use.
-    """
-    from ..models import ComplianceRequirement
-    from ..reference_action import apply_compliance_updates, compliance_code
-
-    normalized = compliance_code(code or "")
-    with SessionLocal() as session:
-        if normalized and session.get(ComplianceRequirement, normalized):
-            return {"added": False, "saved": False, "errors": [
-                f"{normalized} is already on the checklist; change its tier with "
-                "apply_changes compliance_changes instead"]}
-        result = apply_compliance_updates(session, [{
-            "code": code or "", "label": label or "", "tier": tier or "",
-            "match_hint": match_hint or None,
-        }])
-
-    if result["errors"]:
-        return {"added": False, "saved": False,
-                "errors": [e["error"] for e in result["errors"]]}
-
-    created = result["created"][0]
-    _record(tool="add_compliance_requirement", arguments=created)
-    return {
-        "added": True,
-        "saved": True,
-        "requirement": created,
-        "scope": SCOPE_NOTE,
-        "note": (
-            "Quotes already extracted were never checked against this requirement, "
-            "so every current quote counts it as a gap"
-            + (" and would fail Gate 1" if created["tier"] == "MANDATORY" else "")
-            + " until its document is reprocessed from the comparison page. No new "
-            "evaluation run was created."
-        ),
-    }
-
-
 def rerun_evaluation(run_id: str) -> dict:
-    """Evaluate run_id's basket again under the policy in force now, into a
-    new run, and compare it with run_id. Use when the buyer asks to re-run or
-    refresh the evaluation - for example after policy was edited on the
-    Policy in force screen.
+    """Evaluate this basket into a new run under the policy in force, dropping
+    any changes run_id was carrying. This is what the Evaluate basket button
+    does. Use it when the buyer asks to go back to the real policy, or to
+    refresh after the Policy in force screen was edited.
 
     Args:
         run_id: the evaluation run whose basket is re-evaluated.
@@ -642,6 +648,7 @@ def rerun_evaluation(run_id: str) -> dict:
         run = session.get(EvaluationRun, run_id)
         if not run:
             return {"error": f"no evaluation run with id {run_id}"}
+        before = run.result or {}
         try:
             new_run = run_evaluation(session, run.comparison_id)
         except EvaluationError as exc:
@@ -649,9 +656,12 @@ def rerun_evaluation(run_id: str) -> dict:
 
         _record(tool="rerun_evaluation", run_id=run_id, new_run_id=new_run.run_id)
         return {
+            "created": True,
             "new_run_id": new_run.run_id,
             "previous_run_id": run_id,
-            "outcome": compare_outcomes(run.result or {}, new_run.result or {}),
+            "evaluated_with": "the policy in force",
+            "dropped_changes": (run.overrides or {}).get("summary") or [],
+            "outcome": compare_outcomes(before, new_run.result or {}),
         }
 
 
@@ -668,17 +678,17 @@ READ_TOOLS = [
     get_data_quality,
 ]
 
-POLICY_TOOLS = [
+SCENARIO_TOOLS = [
     get_current_policy,
     get_current_materials,
     get_current_compliance,
     simulate_what_if,
-    apply_changes,
-    add_compliance_requirement,
+    rerun_with_changes,
     rerun_evaluation,
 ]
 
 # The one agent - the dashboard chat, the per-run ask endpoint and A2A all use
-# this set. The memo writer gets READ_TOOLS only: drafting a document must
-# never be able to change the policy it documents.
-AGENT_TOOLS = READ_TOOLS + POLICY_TOOLS
+# this set. None of it writes policy: the Policy in force screen is the only
+# way that changes. The memo writer gets READ_TOOLS only, so drafting a
+# document cannot create runs either.
+AGENT_TOOLS = READ_TOOLS + SCENARIO_TOOLS

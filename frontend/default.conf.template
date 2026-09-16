@@ -18,6 +18,11 @@ server {
     }
 
     location / {
+        # index.html, app.js and styles.css keep the same names from one
+        # deploy to the next, so without this a browser happily runs the
+        # previous release out of its cache after an update. "no-cache" means
+        # revalidate, not re-download: the ETag makes it a 304 when unchanged.
+        add_header Cache-Control "no-cache";
         try_files $uri $uri/ /index.html;
     }
 }

@@ -339,11 +339,19 @@ button.chip:hover:not(:disabled) { border-color: var(--accent); color: var(--acc
 .answer table { margin: 8px 0; }
 .answer h2, .answer h3 { font-size: 15px; margin: 14px 0 6px; }
 
+/* The conversation scrolls inside the card rather than pushing the page down.
+   Capped against the viewport so it stays usable on a laptop screen. */
+#agent-history {
+  max-height: min(46vh, 520px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 6px;
+}
 #agent-history:empty { display: none; }
+#agent-history .qa:first-child { border-top: none; padding-top: 0; }
 .chat .spread .chat-intro { flex: 1; }
 .chat .agent-banner { margin: 10px 0 0; }
-.apply-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 10px; }
-.apply-args {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 12px; color: var(--muted); overflow-wrap: anywhere;
-}
+
+.banner.info { background: var(--accent-soft); color: #1b4a7a; }
+.banner ul { margin: 6px 0 0; padding-left: 18px; }
+.banner li { margin: 2px 0; }

@@ -1,11 +1,15 @@
 """The sourcing agent, built on ADK.
 
 One agent answers questions about a finished run, simulates what would change
-under different assumptions, and changes the policy the engine runs on when the
-buyer asks it to. The dashboard chat, the per-run ask endpoint and the A2A
-surface all use it. Its instruction is deliberately restrictive: it may only
-state numbers that came back from a tool, and it must show the gate trail
-rather than assert a conclusion.
+under different assumptions, and - once the buyer confirms - evaluates the
+basket again into a new run under different values. It never changes the policy
+in force: that is the Policy in force screen's job, and the Evaluate basket
+button always evaluates it. The dashboard chat, the per-run ask endpoint and the
+A2A surface all use this agent. Its instruction is deliberately restrictive: it
+may only state numbers that came back from a tool, and every claim has to name
+the rule it rests on. It ends with what the buyer actually reads - the answer
+first, no narration of the work behind it - because that is the part a model
+will otherwise fill with its own process.
 
 A second, read-only configuration drafts the approval memo.
 """
@@ -26,9 +30,10 @@ AGENT_NAME = "sourcing_agent"
 
 DEFAULT_DESCRIPTION = (
     "A procurement analyst for a buyer at a semiconductor plant: explains a "
-    "completed supplier quote evaluation, simulates what-if changes, and "
-    "changes rule thresholds, ceiling prices, required volumes and compliance "
-    "requirements when asked."
+    "completed supplier quote evaluation, simulates what-if changes, and - on "
+    "confirmation - evaluates the basket again into a new run under different "
+    "thresholds, ceiling prices, volumes or compliance tiers. It never changes "
+    "the policy in force."
 )
 
 # How long the agent gets before the deterministic answer is used instead.
@@ -42,104 +47,94 @@ AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))
 
 # No curly braces anywhere in this text: ADK reads a name in braces inside an
 # instruction as a session-state placeholder.
-INSTRUCTION = """You are the sourcing agent for a buyer at a semiconductor
-plant. A deterministic rule engine has evaluated supplier quotations for a
-basket of wet chemicals. You explain that evaluation, simulate what would
-change under different assumptions, and change the policy it runs on when the
-buyer tells you to.
+INSTRUCTION = """You are the sourcing agent for a buyer at a semiconductor plant. A
+deterministic rule engine has evaluated supplier quotations for a basket of wet
+chemicals. You explain that evaluation in plain language, and you explore what
+different values would do to it.
 
-Every request is one of three kinds. Decide which before calling any tool.
+WHAT YOU MAY NOT DO
 
-1. Explain - a question about the evaluation as it stands: ranking, gates,
-   the promotion rule, compliance, prices, allocation, negotiation. Use the
-   read tools against the run id. Change nothing.
-2. What if - a hypothetical: "what if", "what would happen", "would X still
-   win", "suppose", "how sensitive is". Call simulate_what_if. Nothing is
-   saved.
-3. Change - the buyer tells you to change something: "set", "change", "make",
-   "lower", "raise", "remove", "add", "update", "apply that", "go ahead".
-   Call apply_changes, or add_compliance_requirement for a requirement that is
-   not on the checklist yet, or rerun_evaluation to re-evaluate with no
-   change. This saves the change and creates a new evaluation run.
+You never change the policy in force. The thresholds, ceiling prices, required
+volumes and the compliance checklist belong to the buyer and are edited only on
+the Policy in force screen. What you can do is evaluate the basket again under
+different values and keep that as a new evaluation run: that run uses them,
+nothing else does, and the Evaluate basket button still uses the policy in
+force. Never claim you changed policy or saved anything permanently.
 
-If you cannot tell whether the buyer wants a what-if or a real change, run the
-simulation, report it, and ask whether to apply it. Never apply a change the
-buyer did not ask for.
+WHICH KIND OF REQUEST THIS IS
 
-What can be simulated or changed. simulate_what_if and apply_changes take the
-same arguments, lists of "KEY=VALUE" strings:
-- policy_changes: rule thresholds, keyed as in get_current_policy, for example
-  "ceiling_materiality_pct=10" (Gate 3), "moq_overbuy_threshold_pct=15"
-  (Gate 2), "promotion_band_pct=12" (promotion rule) or
-  "max_vendor_share_pct=70" (concentration check).
-- ceiling_price_changes: a material's ceiling price in EUR per litre, keyed by
-  CAS number from get_current_materials, for example "7664-93-9=0.90".
-- volume_changes: a material's required volume in litres, keyed by CAS number,
-  for example "7664-93-9=40000".
-- compliance_changes: an existing checklist code's tier, keyed by code from
-  get_current_compliance: "SDS_LANGUAGE=MANDATORY", "ISO_9001=ADVISORY" or
-  "TSCA=REMOVED".
+1. A question about an evaluation - read the run and answer it. Create nothing.
+2. A hypothetical - "what if", "would", "suppose", "how sensitive". Simulate
+   it. Nothing is saved, not even a run.
+3. A request to work with different values - "change", "set", "lower", "raise",
+   "use 15 instead", "re-run with". Simulate it first, say what it does, and
+   ask whether to create a run for it. Only when the buyer confirms, create the
+   run with the same values that simulation used. If they want the change to
+   apply everywhere, tell them that is the Policy in force screen.
+If a request could be 2 or 3, simulate it and ask.
+
+WORKING WITH VALUES - these keys belong in your tool calls, never in an answer
+
+- policy_changes: a rule threshold, keyed as in get_current_policy, e.g.
+  "ceiling_materiality_pct=15" (Gate 3), "moq_overbuy_threshold_pct=15"
+  (Gate 2), "promotion_band_pct=12" (promotion rule), "max_vendor_share_pct=70"
+  (concentration).
+- ceiling_price_changes: a material's ceiling price in EUR per litre, by CAS
+  number from get_current_materials, e.g. "7664-93-9=0.90".
+- volume_changes: a material's required volume in litres, by CAS number.
+- compliance_changes: a checklist code as MANDATORY, ADVISORY or REMOVED for
+  this run, codes from get_current_compliance.
+
 "Lower the ceiling for sulfuric acid" is a ceiling price; "tolerate more over
-ceiling" is ceiling_materiality_pct; "make SDS mandatory" is a compliance tier.
-If a request could mean more than one of these, ask which.
+ceiling" is the materiality threshold; "make SDS mandatory" is a compliance
+tier. If a request could mean more than one, ask which. A requirement that is
+not on the checklist cannot be added here - that is the Policy in force screen,
+because the quotes have to be read against it first.
 
-Values: a bare number is the new value. For a relative request pass the change
-with a sign and let the tool resolve it: "ceiling_materiality_pct=+2" adds 2
-percentage points, "7664-93-9=-10%" lowers that ceiling by ten percent of its
-current value. For a percentage threshold, "by 2%" means 2 percentage points
-unless the buyer says otherwise. Never work out a new value yourself. Look up
-the current value first with get_current_policy, get_current_materials or
-get_current_compliance unless this conversation already has it.
+A bare number is the new value; a signed one is relative ("+2", "-10%") and the
+tool resolves it - never do that arithmetic yourself. Look up the current value
+first unless this conversation already has it. Values stack on whatever the run
+you are working from already uses; going back to the policy in force is a plain
+re-run.
 
-Reporting a what-if:
-- Say plainly that it is a simulation and nothing was saved.
-- State each change with its previous and new value, as the tool returned
-  them.
-- Say whether the recommendation changes and which suppliers' rank, award
-  status or failed gate move, from the tool's outcome. If nothing moves, say
-  so.
-- If policy_in_force_matches_this_run is false, say the policy has changed
-  since this run, so the comparison is against today's policy.
-- Finish by giving the exact change in KEY=VALUE form and offering to apply
-  it.
+ACCURACY
 
-Reporting a change:
-- Only say something was changed if the tool returned applied or added as
-  true. If it returned errors, nothing was saved: say so and give the reason.
-- State each change with its previous and new value, that a new evaluation run
-  was created, and what moved in the outcome.
-- Say that it applies to every future evaluation, and that runs already
-  created keep the policy they were evaluated with.
-- When the buyer says to apply a simulation, apply exactly the arguments that
-  simulation recorded in this conversation.
-- After a change, later questions are about the new run: use the new_run_id
-  the tool returned as the run id.
-
-Hard rules, always:
 - Never state a number that did not come back from a tool call. Do no
   arithmetic of your own, including percentages and differences.
-- Always name the rule a claim rests on: Gate 1 mandatory compliance, Gate 2
-  MOQ feasibility, Gate 3 ceiling materiality, base ranking by cost, or the
-  promotion rule.
-- When explaining a rank, show the trail: base rank by cost first, then whether
-  the promotion rule fired and which of its four conditions held.
-- The promotion rule only moves a supplier above a cheaper one when all four
-  conditions hold: cost gap inside the band, the cheaper supplier has
-  compliance gaps the candidate does not, payment terms equal or better, and
-  lead time equal or faster. Report each one separately.
-- A compliance requirement that a quote does not mention is a gap. Never
-  describe it as met.
-- Distinguish quoted figures from derived ones. Freight adjustments are a fixed
-  percentage selected by Incoterm and currency conversions use a configured FX
-  rate; neither is a figure the supplier quoted.
-- Historical prices come from the buyer's own purchase history, and the share
-  each vendor holds today is measured from it. The proposed award split is a
-  configured assumption - say so when you use it.
-- Every run-scoped tool needs the evaluation run id. It comes with the request;
-  if it does not, ask for it. Never invent one.
-- If the run does not contain the answer, say so plainly.
+- Name the rule a claim rests on: Gate 1 mandatory compliance, Gate 2 MOQ
+  feasibility, Gate 3 ceiling materiality, ranking by cost, or the promotion
+  rule.
+- The promotion rule moves a supplier above a cheaper one only when all four
+  conditions hold: the cost gap is inside the band, the cheaper supplier has
+  compliance gaps the candidate does not, payment terms are equal or better,
+  and lead time is equal or faster.
+- A compliance requirement a quote does not mention is a gap, never "met".
+- Freight percentages and the FX rate are policy rather than quoted figures,
+  and the award split is a configured assumption. Say so when you use them.
+- Every run-scoped tool needs the run id that came with the request. Never
+  invent one; if there is none, ask.
+- If the run does not answer the question, say so plainly.
 
-Write in plain prose for a buyer. Be concise and specific.
+THE ANSWER THE BUYER READS
+
+This is what you are judged on. The buyer wants the answer, not your work.
+
+- Put the answer in the first sentence. Follow it with at most three short
+  sentences of evidence: the rule that decided it and the figures behind it.
+- Plain prose, for a buyer. No headings, no numbered steps, no tables unless
+  the buyer asks to compare. Use bullets only for a real list - one line each,
+  no sub-bullets.
+- Never mention tools, functions, arguments, keys, field names or JSON, and
+  never narrate your work: no "let me check", no "I called", no "based on the
+  data returned", no description of what you are about to do.
+- Keep run ids out of the answer unless asked; the screen links them already.
+- No preamble, no restating the question, no summary of what you just said and
+  no offer of further help - except the one confirmation question when a change
+  is waiting for a yes, which is a single short line at the end.
+- A simulation says in one clause that it is a simulation and nothing is saved.
+  A new run says in one clause that the values apply to that run only and the
+  policy in force is unchanged.
+- Under 120 words unless the buyer asked for a list or a comparison.
 """
 
 MEMO_INSTRUCTION = """Write the sourcing approval package for management
@@ -157,8 +152,11 @@ Approver. Leave Prepared by and Approver blank for signature. There is no RFQ
 reference field - the quotations do not carry one, so do not add a row for it.
 
 ## 1. Executive Summary
-Three short paragraphs, each starting with its label: "Sourcing event summary:",
-"Sourcing objective:", "Recommendation:".
+If the run summary says this run was evaluated with values that are not the
+policy in force, open the section with one italic line saying it is a scenario
+run, not for sign-off as it stands, and listing those values. Then three short
+paragraphs, each starting with its label: "Sourcing event summary:", "Sourcing
+objective:", "Recommendation:".
 
 ## 2. Supplier Comparison
 A table with the suppliers as columns and these as rows: Total Landed Cost,
@@ -202,13 +200,14 @@ Currency is EUR throughout and every amount says so. Do not invent a figure, an
 RFQ number or a person's name; leave a field blank rather than filling it.
 """
 
-# Tools that change policy or create a run. A reply about one of these has to
-# be accurate even when the model never got to write it - see _unfinished_reply.
-CHANGING_TOOLS = {"apply_changes", "add_compliance_requirement", "rerun_evaluation"}
+# Tools that create a run. A reply about one of these has to be accurate even
+# when the model never got to write it - see _unfinished_reply.
+CHANGING_TOOLS = {"rerun_with_changes", "rerun_evaluation"}
 
 
 def build_agent(instruction: str = INSTRUCTION, description: str = "", tools=None):
     from google.adk.agents import Agent
+    from google.genai import types
 
     return Agent(
         name=AGENT_NAME,
@@ -216,6 +215,11 @@ def build_agent(instruction: str = INSTRUCTION, description: str = "", tools=Non
         instruction=instruction,
         description=description or DEFAULT_DESCRIPTION,
         tools=list(tools if tools is not None else AGENT_TOOLS),
+        # Answering a buyer from figures a rule engine produced is not a
+        # creative task. At the model's default temperature the same question
+        # comes back as a paragraph one time and a set of headings the next;
+        # low and steady is what makes the replies read alike.
+        generate_content_config=types.GenerateContentConfig(temperature=0.2),
     )
 
 
@@ -305,9 +309,11 @@ def _agent_timed_out(operation: str) -> None:
 def _transcript(history: list[dict] | None) -> str:
     """Earlier turns, replayed into the prompt.
 
-    An agent turn that simulated or changed something carries its exact tool
-    arguments, so "apply that" applies what was simulated rather than what the
-    prose happened to say about it.
+    An agent turn that simulated or created a run carries its exact tool
+    arguments, so "yes, do it" runs what was simulated rather than what the
+    prose happened to say about it. Those lines are marked as yours alone:
+    they are a note to yourself, and repeating them at the buyer is exactly
+    the kind of process talk the instruction rules out.
     """
     if not history:
         return ""
@@ -320,26 +326,25 @@ def _transcript(history: list[dict] | None) -> str:
         for action in turn.get("actions") or []:
             arguments = {k: v for k, v in (action.get("arguments") or {}).items() if v}
             created = f", which created run {action['new_run_id']}" if action.get("new_run_id") else ""
-            turns.append(f"  (you called {action.get('tool')} with {arguments}{created})")
+            turns.append(f"  [your own note, never shown to the buyer] "
+                         f"{action.get('tool')} {arguments}{created}")
     return "Earlier in this conversation:\n" + "\n".join(turns) + "\n\n"
 
 
 def _describe_action(action: dict) -> list[str]:
     tool = action.get("tool")
-    if tool == "apply_changes":
+    if tool == "rerun_with_changes":
         lines = []
         for change in action.get("changes") or []:
             subject = change["key"] + (f" ({change['material']})" if change.get("material") else "")
             unit = f" {change['unit']}" if change.get("unit") else ""
-            lines.append(f"- Changed {change['kind']} {subject}: "
+            lines.append(f"- For this run only, {change['kind']} {subject}: "
                          f"{change.get('previous')} to {change['new']}{unit}")
-        return lines + [f"- Created evaluation run {action['new_run_id']}"]
-    if tool == "add_compliance_requirement":
-        added = action.get("arguments") or {}
-        return [f"- Added compliance requirement {added.get('code')} "
-                f"({added.get('label')}) as {added.get('tier')}"]
+        return lines + [f"- Created evaluation run {action['new_run_id']}",
+                        "- The policy in force was not changed"]
     if tool == "rerun_evaluation":
-        return [f"- Re-evaluated the basket into run {action['new_run_id']}"]
+        return [f"- Re-evaluated the basket under the policy in force into run "
+                f"{action['new_run_id']}"]
     return []
 
 
@@ -363,12 +368,12 @@ def _unfinished_reply(run_id: str, turn: TurnLog) -> str:
 
 async def chat(run_id: str, question: str, history: list[dict] | None = None,
                operation: str = "chat") -> dict:
-    """Answer one request - explain, simulate or change; the agent decides.
+    """Answer one request - explain, simulate, or evaluate into a new run.
 
     Returns the reply with what the turn did: new_run_id when the basket was
-    re-evaluated into a new run, last_simulation (the arguments that would
-    apply it) when the turn ended on an unsaved what-if, and the actions
-    themselves for the transcript.
+    re-evaluated into a new run, last_simulation (the arguments behind the
+    what-if it ended on) and the actions themselves for the transcript. No
+    path here changes the policy in force.
 
     Continuity is a transcript replayed into the prompt, not a persistent ADK
     session - _ask() still builds and tears down a fresh InMemoryRunner every
@@ -378,10 +383,15 @@ async def chat(run_id: str, question: str, history: list[dict] | None = None,
     which is what makes it survive a request landing on a different Cloud Run
     instance than the one before it.
     """
+    # The closing line repeats the one rule a model most often drops by the
+    # time it has read a page of tool output, and it sits where the next
+    # tokens are written from.
     prompt = (
         f"The evaluation run id is {run_id}. Use it for every run-scoped tool, "
         f"unless a change in this turn creates a newer run.\n\n"
-        f"{_transcript(history)}New request from the buyer:\n\n{question}"
+        f"{_transcript(history)}New request from the buyer:\n\n{question}\n\n"
+        f"Reply to the buyer: the answer first, in plain prose, with no mention "
+        f"of tools or of the steps you took."
     )
     with record_turn() as turn:
         try:
@@ -441,45 +451,41 @@ async def draft_memo(run_id: str) -> str:
 
 
 def fallback_explanation(run_id: str) -> str:
-    """Used when Vertex is unreachable. Reads the same stored values the agent
-    would have read, so the answer is still correct, just less fluent."""
-    from .tools import get_gate_results, get_promotion_detail, get_run_summary
+    """The reply when Vertex is unreachable or too slow.
+
+    The same stored values the agent would have read, written the way the
+    instruction asks the agent to write: the recommendation first, then each
+    supplier in one line with the rule that decided it. A dump of every gate
+    and promotion condition would be more complete and much worse to read -
+    and this is a fallback the buyer sees without being told a model was
+    involved at all.
+    """
+    from .tools import get_run_summary
 
     summary = get_run_summary(run_id)
     if not summary or summary.get("error"):
         return "That run could not be found."
 
-    lines = ["**Ranking**", ""]
-    for supplier in summary["suppliers"]:
-        rank = supplier.get("final_rank") or "-"
-        lines.append(
-            f"- Rank {rank}: {supplier['supplier_name']} - "
-            f"EUR {supplier['total_landed_cost_eur']} - "
-            f"{supplier.get('award_status')}. {supplier.get('primary_reason')}"
-        )
+    suppliers = summary["suppliers"]
+    primary = next((s for s in suppliers if s.get("final_rank") == 1), None)
 
-    lines += ["", "**Gate trail**", ""]
-    for supplier_id, gates in get_gate_results(run_id).items():
-        for gate in gates:
-            verdict = "pass" if gate["passed"] else "fail"
-            lines.append(
-                f"- {supplier_id} Gate {gate['gate_no']} "
-                f"({gate['gate_name']}): {verdict}. "
-                f"{gate['detail'].get('explanation', '')}"
-            )
+    if primary:
+        lines = [f"{primary['supplier_name']} is the recommendation, at EUR "
+                 f"{primary['total_landed_cost_eur']} total landed cost. "
+                 f"{primary.get('primary_reason') or ''}".strip()]
+    else:
+        lines = ["No supplier is recommended in this run: none of them cleared "
+                 "every gate."]
 
-    promotions = get_promotion_detail(run_id)["promotions"]
-    if promotions:
-        lines += ["", "**Promotion rule**", ""]
-        for promo in promotions:
+    others = [s for s in suppliers if s is not primary]
+    if others:
+        lines.append("")
+        for supplier in sorted(others, key=lambda s: s.get("final_rank") or 99):
+            standing = (f"rank {supplier['final_rank']}" if supplier.get("final_rank")
+                        else "not ranked")
             lines.append(
-                f"- {promo['candidate_supplier_id']} against "
-                f"{promo['cheaper_supplier_id']}: "
-                f"cost {promo['cost_condition_met']}, "
-                f"compliance {promo['compliance_condition_met']}, "
-                f"payment terms {promo['payment_condition_met']}, "
-                f"lead time {promo['lead_time_condition_met']} "
-                f"-> {'promoted' if promo['promoted'] else 'not promoted'}"
-            )
+                f"- {supplier['supplier_name']}: EUR "
+                f"{supplier['total_landed_cost_eur']}, {standing}. "
+                f"{supplier.get('primary_reason') or ''}".strip())
 
     return "\n".join(lines)

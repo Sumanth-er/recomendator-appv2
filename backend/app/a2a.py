@@ -32,11 +32,13 @@ RPC_PATH = "/a2a"
 DESCRIPTION = (
     "Answers questions about a completed semiconductor wet-chemicals quote "
     "comparison: supplier ranking, compliance gates, ceiling-price variance, "
-    "the promotion rule, award allocation and renegotiation candidates. It "
-    "can also simulate what-if changes without saving, and - when explicitly "
-    "asked - change rule thresholds, ceiling prices, required volumes or "
-    "compliance tiers and re-evaluate into a new run. Every figure comes from "
-    "the rule engine. Callers must supply the evaluation run id."
+    "the promotion rule, award allocation and renegotiation candidates. It can "
+    "also simulate what-if changes without saving, and - when explicitly asked "
+    "- evaluate the basket again into a new run under different thresholds, "
+    "ceiling prices, volumes or compliance tiers. It never changes the policy "
+    "in force: those values apply to the run it creates and to nothing else. "
+    "Every figure comes from the rule engine. Callers must supply the "
+    "evaluation run id."
 )
 
 

@@ -23,7 +23,7 @@ from .models import (
     ApprovedSupplier, Benchmark, ComplianceRequirement, Demand, EvaluationRun,
     FreightPolicy, HistoricalPrice, Material, PolicyConfig, Quote, Supplier,
 )
-from .reference_action import REMOVED, ChangeSet, apply_change_set
+from .reference_action import REMOVED, ChangeSet, describe_overrides
 
 from . import telemetry
 
@@ -244,14 +244,32 @@ def _evaluate(inputs: dict) -> dict:
     )
 
 
-def run_evaluation(session: Session, comparison_id: str) -> EvaluationRun:
-    inputs = _prepare(session, comparison_id)
+def run_evaluation(session: Session, comparison_id: str,
+                   changes: ChangeSet | None = None) -> EvaluationRun:
+    """Evaluate the basket and store the run.
+
+    With no changes this is the Evaluate button: the policy in force, exactly
+    as the Policy in force screen holds it. With changes it is the agent's
+    scenario - the same engine over the same quotes, with those values laid
+    over the reference data in memory for this run only. Either way nothing in
+    policy_config, benchmark, demand or compliance_requirement is written, and
+    the run records which of the two it is.
+    """
+    inputs = _prepare(session, comparison_id, changes)
 
     with telemetry.tracer().start_as_current_span("engine.evaluate") as span:
         span.set_attribute("comparison.id", comparison_id)
         span.set_attribute("quote.count", len(inputs["quotes"]))
         span.set_attribute("engine.version", settings.engine_version)
+        span.set_attribute("run.overridden", bool(changes and not changes.is_empty()))
         result = _evaluate(inputs)
+
+    overrides = None
+    if changes and not changes.is_empty():
+        overrides = {
+            "arguments": changes.as_arguments(),
+            "summary": describe_overrides(session, changes),
+        }
 
     run = EvaluationRun(
         comparison_id=comparison_id,
@@ -259,6 +277,7 @@ def run_evaluation(session: Session, comparison_id: str) -> EvaluationRun:
         policy_snapshot=inputs["policy"].to_dict(),
         engine_version=settings.engine_version,
         result=result,
+        overrides=overrides,
     )
     session.add(run)
     session.commit()
@@ -277,26 +296,12 @@ def simulate(session: Session, comparison_id: str,
     were lower" is the second kind; "what if SDS became mandatory" is the
     fourth.
 
-    Nothing is written: no EvaluationRun row, no change to policy_config,
-    benchmark, demand or compliance_requirement. This is what makes a "what
-    if" question answerable without touching the numbers every other
-    evaluation relies on. With no changes it evaluates the policy in force
-    today, which is the baseline a simulation is compared against.
+    Nothing is written at all - not even an EvaluationRun row, which is the
+    only difference from run_evaluation(). This is what makes a "what if"
+    question answerable without leaving a run behind for every idea. With no
+    changes it evaluates the policy in force today, which is the baseline a
+    simulation is compared against.
     """
     with telemetry.tracer().start_as_current_span("engine.simulate") as span:
         span.set_attribute("comparison.id", comparison_id)
         return _evaluate(_prepare(session, comparison_id, changes))
-
-
-def apply_changes_and_evaluate(
-    session: Session, comparison_id: str, changes: ChangeSet
-) -> EvaluationRun:
-    """Make a ChangeSet real, then evaluate the basket under it.
-
-    The simulation first is a dry run: if the changed policy cannot be
-    evaluated at all, nothing is written, rather than leaving policy changed
-    with no run to show for it.
-    """
-    simulate(session, comparison_id, changes)
-    apply_change_set(session, changes)
-    return run_evaluation(session, comparison_id)

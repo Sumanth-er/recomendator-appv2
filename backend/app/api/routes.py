@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import SessionLocal, get_session
-from ..evaluation import EvaluationError, apply_changes_and_evaluate, run_evaluation
+from ..evaluation import EvaluationError, run_evaluation
 from .. import reference_action as reference_actions
 from ..ingest import storage
 from ..ingest.pipeline import file_hash, process_document
@@ -400,6 +400,11 @@ def get_quote(quote_id: str, session: Session = Depends(get_session)):
 
 @router.post("/comparisons/{comparison_id}/runs")
 def create_run(comparison_id: str, session: Session = Depends(get_session)):
+    """Evaluate the basket under the policy in force - the Evaluate button.
+
+    Never carries the agent's run-only changes: those belong to the run the
+    agent made and to nothing else.
+    """
     try:
         run = run_evaluation(session, comparison_id)
     except EvaluationError as exc:
@@ -418,6 +423,9 @@ def get_run(run_id: str, session: Session = Depends(get_session)):
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "engine_version": run.engine_version,
         "policy_snapshot": run.policy_snapshot,
+        # Set only on a run the agent made under changed values; the dashboard
+        # says so rather than letting it pass for the policy in force.
+        "overrides": run.overrides,
         "result": run.result,
     }
 
@@ -646,64 +654,6 @@ async def ask_chat_session(session_id: str, payload: AskRequest,
     }
 
 
-class ApplyAndRerunRequest(BaseModel):
-    """What the chat's "Apply this change" button sends under a simulation.
-
-    The same "KEY=VALUE" lists simulate_what_if took - the reply's
-    last_simulation, passed back unchanged - validated by the same parser, so
-    the button applies exactly what was simulated. A deterministic path that
-    does not depend on the model reading its own transcript back correctly.
-    """
-    comparison_id: str
-    policy_changes: list[str] = []
-    ceiling_price_changes: list[str] = []
-    volume_changes: list[str] = []
-    compliance_changes: list[str] = []
-    session_id: str | None = None  # if set, records this action in the transcript
-
-
-@router.post("/reference/apply-and-rerun")
-def apply_and_rerun(payload: ApplyAndRerunRequest, session: Session = Depends(get_session)):
-    if not session.get(Comparison, payload.comparison_id):
-        raise HTTPException(404, "comparison not found")
-
-    changes, errors = reference_actions.parse_changes(
-        session, payload.policy_changes, payload.ceiling_price_changes,
-        payload.volume_changes, payload.compliance_changes)
-    if not errors and changes.is_empty():
-        errors = ["no changes were given"]
-    if errors:
-        raise HTTPException(400, "; ".join(errors))
-
-    try:
-        run = apply_changes_and_evaluate(session, payload.comparison_id, changes)
-    except EvaluationError as exc:
-        session.rollback()
-        raise HTTPException(400, str(exc)) from exc
-
-    chat_session = (session.get(ChatSession, payload.session_id)
-                    if payload.session_id else None)
-    if chat_session and chat_session.comparison_id == payload.comparison_id:
-        described = "; ".join(
-            f"{c['kind']} {c['key']}: {c['previous']} to {c['new']}"
-            f"{' ' + c['unit'] if c.get('unit') else ''}"
-            for c in changes.details)
-        session.add(ChatMessage(
-            session_id=payload.session_id, role="agent",
-            content=f"Applied the simulated change ({described}) and created a "
-                    f"new evaluation run.",
-            resulting_run_id=run.run_id,
-            actions=[{"tool": "apply_changes", "arguments": changes.as_arguments(),
-                      "changes": changes.details, "new_run_id": run.run_id}],
-        ))
-        chat_session.last_active_at = datetime.now(timezone.utc)
-        session.commit()
-
-    log.info("apply-and-rerun: comparison=%s new_run=%s changes=%s",
-             payload.comparison_id, run.run_id, changes.as_arguments())
-    return {"run_id": run.run_id, "changes": changes.details}
-
-
 # ---------------------------------------------------------------------------
 # Category strategy document - one-time policy setup (spec 2.3)
 # ---------------------------------------------------------------------------
@@ -822,9 +772,11 @@ def update_policy(payload: PolicyBulkUpdate, session: Session = Depends(get_sess
     Every evaluation run snapshots the policy in force at the time it ran
     (EvaluationRun.policy_snapshot), so a change here never rewrites an
     earlier run's stored figures - it only takes effect on the next
-    evaluation. The validation itself lives in reference_actions, shared with
-    the agent's own apply-and-rerun action - one set of rules, not two that
-    can drift apart.
+    evaluation. This screen is the only place the policy in force changes:
+    the agent can evaluate a basket under different values, but only into a
+    run of its own. The validation itself lives in reference_actions, shared
+    with the agent's run-only changes - one set of rules, not two that can
+    drift apart.
     """
     result = reference_actions.apply_policy_updates(
         session, [u.model_dump() for u in payload.updates])
@@ -857,7 +809,7 @@ def update_compliance(payload: ComplianceBulkUpdate, session: Session = Depends(
     two breaks the promotion rule. Extraction re-reads this table on every
     document processed, so a tier flip or a brand-new code takes effect on
     the next upload, not retroactively. The validation itself lives in
-    reference_actions, shared with the agent's own apply-and-rerun action.
+    reference_actions, shared with the agent's run-only changes.
     """
     result = reference_actions.apply_compliance_updates(
         session, [u.model_dump() for u in payload.updates])

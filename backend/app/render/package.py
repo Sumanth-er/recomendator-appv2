@@ -145,6 +145,10 @@ def _context(run_id: str) -> dict | None:
         return {
             "result": run.result or {},
             "policy": run.policy_snapshot or {},
+            # Set when the agent evaluated this run under values that are not
+            # the policy in force. A package is a document someone signs, so
+            # it has to say that on its face.
+            "overrides": (run.overrides or {}).get("summary") or [],
             "created_at": run.created_at,
             "engine_version": run.engine_version,
             "comparison_name": comparison.name if comparison else None,
@@ -230,7 +234,12 @@ def _executive_summary(result, kpis, suppliers, primary, secondary,
     # clause drops out rather than printing a placeholder.
     plant = ctx.get("plant") or "-"
     destination = f" for delivery to {plant}" if plant != "-" else ""
-    blocks = [
+    scenario = [
+        note("Scenario run - not for sign-off as it stands. This evaluation used "
+             "values that apply to this run only and are not the policy in force: "
+             + "; ".join(ctx["overrides"]) + ".")
+    ] if ctx.get("overrides") else []
+    blocks = scenario + [
         para(f"Sourcing event summary: {kpis.get('supplier_count', 0)} quotations "
              f"received covering {kpis.get('material_count', 0)} materials"
              f"{destination}. Suppliers quoting: {names}."),

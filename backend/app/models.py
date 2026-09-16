@@ -332,6 +332,14 @@ class EvaluationRun(Base):
     totals, the gate trail, the promotion decision, allocation and
     renegotiation candidates. `policy_snapshot` freezes the thresholds and FX
     rate that were in force, so the run reproduces exactly.
+
+    `overrides` is set only on a run the agent created with changes that apply
+    to this run alone - a different threshold, ceiling price, required volume
+    or compliance tier. The policy in force is not touched by them, which is
+    why they have to be recorded here: without it, the run's figures could not
+    be explained from policy_config, and nobody could tell an agent scenario
+    apart from an evaluation of the real policy. A run from the Evaluate
+    button has none.
     """
     __tablename__ = "evaluation_run"
     run_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
@@ -340,6 +348,7 @@ class EvaluationRun(Base):
     policy_snapshot: Mapped[dict] = mapped_column(JSON)
     engine_version: Mapped[str] = mapped_column(String(32))
     result: Mapped[dict] = mapped_column(JSON)
+    overrides: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 class ChatSession(Base):

@@ -49,21 +49,28 @@ when `A2A_ENABLED=1`). Each request is one of three kinds, and the agent picks:
 | Request | What happens | Saved? |
 |---|---|---|
 | "Why is Alpha ranked above Beta?" | Read tools over the stored run | Nothing |
-| "What if the ceiling materiality threshold were 7%?" | `simulate_what_if` runs the real engine on the real quotes with the change laid over the policy in memory, and compares the outcome with today's policy. The reply offers *Apply this change* | Nothing |
-| "Make REACH mandatory", "lower the sulfuric acid ceiling by 10%", "apply that" | `apply_changes` validates, saves the change, and re-evaluates the basket into a new run | Policy, and a new run |
+| "What if the ceiling materiality threshold were 15%?" | `simulate_what_if` runs the real engine on the real quotes with that value laid over the reference data in memory, compares the outcome with this run, and asks whether to make a run of it | Nothing |
+| "Yes, go ahead" | `rerun_with_changes` evaluates the basket into a new run under those values, and the browser opens it | A new run |
 
-What can change: any rule threshold in `policy_config`, a material's ceiling
-price or required volume, and a checklist code's tier (mandatory, advisory or
-removed). A brand-new checklist requirement can be added too, but creates no run:
-quotes already extracted were never checked against it, so the documents need
-reprocessing first.
+**The agent never changes the policy in force.** Thresholds, ceiling prices,
+required volumes and the compliance checklist are edited only under *Policy in
+force*, and **Evaluate basket** always evaluates that policy. What the agent
+produces is a scenario run: the values apply to that run alone, it is labelled
+as a scenario on the dashboard, and `evaluation_run.overrides` records what it
+was evaluated with. A run built from a scenario run inherits its values, so
+changes stack until you ask for a plain re-run.
+
+What can be given a different value for a run: any rule threshold in
+`policy_config`, a material's ceiling price or required volume, and a checklist
+code's tier (mandatory, advisory or removed). A requirement that is not on the
+checklist cannot be added this way - the quotes were never read against it, so
+it is added under *Policy in force* and the documents reprocessed.
 
 The model still does no arithmetic. Changes are passed as `KEY=VALUE` strings;
-a relative change ("+2", "-10%") is resolved in `reference_action.py`, and the
-before-and-after comparison is computed in `agent/tools.py`. Simulation and apply
-share one parser, so what is simulated is exactly what gets applied. Policy is
-shared: a change applies to every future evaluation in every comparison, while
-existing runs keep the policy they were evaluated with.
+a relative change ("+2", "-10%") is resolved in `reference_action.py` against
+the value that run actually used, and the before-and-after comparison is
+computed in `agent/tools.py`. Simulation and run share one parser, so what was
+simulated is exactly what the run is made from.
 
 ## Deploying
 
